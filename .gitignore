@@ -1,0 +1,8 @@
+.env
+data/
+temp/
+vendor/
+
+# Built release zips (output of package.ps1 / package.sh).
+# The README and the scripts themselves stay tracked.
+dist/*.zip
