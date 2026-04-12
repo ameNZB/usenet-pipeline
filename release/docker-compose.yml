@@ -20,19 +20,17 @@ services:
     ports:
       - "8080:8080"
     volumes:
-      - ${DATA_DIR:-./data}/gluetun:/gluetun
+      - ./data/gluetun:/gluetun
     restart: unless-stopped
 
   agent:
-    build: .
-    image: usenet-pipeline:latest
+    image: ghcr.io/YOUR_USERNAME/usenet-pipeline:latest
     container_name: indexer-agent
     # VPN routing mode:
     #   VPN_DOWNLOAD_ONLY=false (default): ALL traffic through VPN (kill-switch).
-    #     → uncomment network_mode below, comment out the network section.
     #   VPN_DOWNLOAD_ONLY=true: only torrent downloads through VPN (SOCKS5 proxy),
     #     NNTP uploads go direct for full upload speed.
-    #     → comment out network_mode, use default networking.
+    #     → set AGENT_NETWORK_MODE=bridge in .env
     network_mode: "${AGENT_NETWORK_MODE:-service:vpn}"
     depends_on:
       - vpn
@@ -43,7 +41,7 @@ services:
       - POLL_INTERVAL=${POLL_INTERVAL:-30}
       # Directories
       - TEMP_DIR=/data/temp
-      # VPN split-tunnel — set VPN_DOWNLOAD_ONLY=true to route only torrents through VPN
+      # VPN split-tunnel
       - VPN_DOWNLOAD_ONLY=${VPN_DOWNLOAD_ONLY:-false}
       - VPN_PROXY_ADDR=${VPN_PROXY_ADDR:-vpn:1080}
       # NNTP / Usenet upload
@@ -62,5 +60,5 @@ services:
       - ENCRYPT=${ENCRYPT:-true}
       - PAR2_REDUNDANCY=${PAR2_REDUNDANCY:-5}
     volumes:
-      - ${DATA_DIR:-./data}/agent:/data
+      - ./data/agent:/data
     restart: unless-stopped

@@ -188,6 +188,24 @@ docker compose up -d
 - Check pool filter isn't excluding available requests
 - Verify there are unfulfilled requests on the site
 
+## Built With
+
+### Docker / Infrastructure
+
+- [Gluetun](https://github.com/qdm12/gluetun) — VPN client container with kill-switch and SOCKS5 proxy
+- [ParPar](https://github.com/animetosho/ParPar) — high-performance, multi-threaded PAR2 generator
+- [par2cmdline](https://github.com/Parchive/par2cmdline) — PAR2 recovery (fallback when ParPar is unavailable)
+- [FFmpeg](https://github.com/FFmpeg/FFmpeg) — screenshot capture and media processing
+- [7-Zip](https://github.com/ip7z/7zip) — encryption with header obfuscation
+
+### Go Libraries
+
+- [anacrolix/torrent](https://github.com/anacrolix/torrent) — pure Go BitTorrent client
+- [go-ffprobe](https://github.com/vansante/go-ffprobe) — FFprobe wrapper for media metadata extraction
+- [google/uuid](https://github.com/google/uuid) — UUID generation for NNTP Message-IDs
+
+NNTP uploading and yEnc encoding are implemented from scratch using Go's standard library (`net/textproto`, `crypto/tls`).
+
 ## License
 
 [MIT](LICENSE)
