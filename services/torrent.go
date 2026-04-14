@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 	"github.com/ameNZB/usenet-pipeline/config"
@@ -17,7 +18,62 @@ import (
 
 	"github.com/anacrolix/torrent"
 	"golang.org/x/net/proxy"
+	"golang.org/x/time/rate"
 )
+
+// layeredInt pulls a whole-number setting from the layered config; returns
+// the fallback when the key is unset or not parseable.
+func layeredInt(cfg *config.Config, key string, fallback int) int {
+	if cfg == nil || cfg.Layered == nil {
+		return fallback
+	}
+	v := cfg.Layered.Effective(key)
+	if v == "" {
+		return fallback
+	}
+	if i, err := strconv.Atoi(v); err == nil {
+		return i
+	}
+	return fallback
+}
+
+// layeredFloat is the float64 variant of layeredInt.
+func layeredFloat(cfg *config.Config, key string, fallback float64) float64 {
+	if cfg == nil || cfg.Layered == nil {
+		return fallback
+	}
+	v := cfg.Layered.Effective(key)
+	if v == "" {
+		return fallback
+	}
+	if f, err := strconv.ParseFloat(v, 64); err == nil {
+		return f
+	}
+	return fallback
+}
+
+// seedOpts reads torrent_* knobs from the layered config. 0 means "don't
+// seed" and skips the whole seeding phase — matching the pre-seeding
+// behaviour so users who haven't enabled it see no change.
+type seedOpts struct {
+	UploadKBps   int
+	RatioTarget  float64
+	MaxHours     float64
+	RequireFull  bool
+	StallMins    int
+	ListenPort   int
+}
+
+func seedOptsFromConfig(cfg *config.Config) seedOpts {
+	return seedOpts{
+		UploadKBps:  layeredInt(cfg, "torrent_max_upload_kbps", 0),
+		RatioTarget: layeredFloat(cfg, "torrent_seed_ratio", 0),
+		MaxHours:    layeredFloat(cfg, "torrent_seed_hours", 0),
+		RequireFull: layeredInt(cfg, "torrent_require_full_seed", 0) == 1,
+		StallMins:   layeredInt(cfg, "torrent_no_full_seed_timeout_mins", 0),
+		ListenPort:  layeredInt(cfg, "torrent_port", 0),
+	}
+}
 
 // applyVPNProxy configures the torrent client to route all traffic through a
 // SOCKS5 proxy (e.g. gluetun) when VPN_DOWNLOAD_ONLY is enabled. This lets
@@ -53,11 +109,17 @@ func DownloadTorrent(ctx context.Context, torrentPath string, cfg *config.Config
 		return "", fmt.Errorf("create download dir: %w", err)
 	}
 
+	so := seedOptsFromConfig(cfg)
 	clientConfig := torrent.NewDefaultClientConfig()
 	clientConfig.DataDir = dataDir
 	clientConfig.DisableIPv6 = true
 	clientConfig.NoDefaultPortForwarding = true
-	clientConfig.ListenPort = 0 // random port
+	clientConfig.ListenPort = so.ListenPort // 0 = random
+	if so.UploadKBps > 0 {
+		// burst = 1s worth of tokens keeps the limiter responsive without
+		// starving bursty writers. Values are bytes/sec, not bits.
+		clientConfig.UploadRateLimiter = rate.NewLimiter(rate.Limit(so.UploadKBps*1024), so.UploadKBps*1024)
+	}
 	applyVPNProxy(clientConfig, cfg)
 
 	client, err := torrent.NewClient(clientConfig)
@@ -74,7 +136,7 @@ func DownloadTorrent(ctx context.Context, torrentPath string, cfg *config.Config
 	log.Printf("Fetching metadata for %s...", filepath.Base(torrentPath))
 	<-t.GotInfo()
 
-	return downloadAndWait(ctx, client, t, dataDir, jobName, nil)
+	return downloadAndWaitSeed(ctx, client, t, dataDir, jobName, nil, so)
 }
 
 // DownloadMagnet downloads a torrent by magnet URI (used for site-assigned tasks).
@@ -102,11 +164,17 @@ func DownloadMagnet(ctx context.Context, magnetURI string, cfg *config.Config, j
 		return "", fmt.Errorf("create download dir: %w", err)
 	}
 
+	so := seedOptsFromConfig(cfg)
 	clientConfig := torrent.NewDefaultClientConfig()
 	clientConfig.DataDir = dataDir
 	clientConfig.DisableIPv6 = true
 	clientConfig.NoDefaultPortForwarding = true
-	clientConfig.ListenPort = 0 // random port — avoids bind conflicts with concurrent downloads
+	clientConfig.ListenPort = so.ListenPort // 0 = random
+	if so.UploadKBps > 0 {
+		// burst = 1s worth of tokens keeps the limiter responsive without
+		// starving bursty writers. Values are bytes/sec, not bits.
+		clientConfig.UploadRateLimiter = rate.NewLimiter(rate.Limit(so.UploadKBps*1024), so.UploadKBps*1024)
+	}
 	applyVPNProxy(clientConfig, cfg)
 
 	client, err := torrent.NewClient(clientConfig)
@@ -153,7 +221,77 @@ func DownloadMagnet(ctx context.Context, magnetURI string, cfg *config.Config, j
 	// Reserve space NOW (before download starts) so concurrent tasks see it.
 	ReserveDisk(jobName, torrentSize)
 
-	return downloadAndWait(ctx, client, t, dataDir, jobName, opts)
+	return downloadAndWaitSeed(ctx, client, t, dataDir, jobName, opts, so)
+}
+
+// runSeedPhase keeps the torrent active after download completion until
+// one of these boundary conditions is hit: target upload ratio reached,
+// max seed time elapsed, or the context is cancelled. The UploadRateLimiter
+// configured on the client bounds outbound bandwidth; here we only track
+// progress and emit status updates the dashboard renders as a seed bar.
+//
+// Ratio is computed as bytesWritten / torrentSize — close enough for the
+// display and the stopping condition. anacrolix/torrent doesn't expose a
+// first-class ratio getter, so this stays manual.
+func runSeedPhase(ctx context.Context, t *torrent.Torrent, jobName string, so seedOpts) {
+	total := t.Length()
+	if total <= 0 {
+		return
+	}
+	deadline := time.Time{}
+	if so.MaxHours > 0 {
+		deadline = time.Now().Add(time.Duration(so.MaxHours * float64(time.Hour)))
+	}
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+	log.Printf("[%s] Seeding: ratio target %.2f, max %.1fh, cap %d KB/s",
+		jobName, so.RatioTarget, so.MaxHours, so.UploadKBps)
+	var lastWritten int64
+	for {
+		select {
+		case <-ctx.Done():
+			log.Printf("[%s] Seeding: cancelled", jobName)
+			return
+		case <-ticker.C:
+			stats := t.Stats()
+			written := stats.BytesWrittenData.Int64()
+			ratio := float64(written) / float64(total)
+			speed := float64(written-lastWritten) / 2.0 / 1024 / 1024 // MB/s (2s tick)
+			lastWritten = written
+			peers := len(t.PeerConns())
+
+			// Surface seed progress through the existing callback so the
+			// dashboard can render a ratio/time bar without a new channel.
+			if cb := GetProgressCallback(jobName); cb != nil {
+				// Percent here is seed progress (ratio%) — the "phase"
+				// value tells the dashboard to switch to a seed bar.
+				var pct float64
+				if so.RatioTarget > 0 {
+					pct = ratio / so.RatioTarget * 100
+				} else if !deadline.IsZero() {
+					total := deadline.Sub(deadline.Add(-time.Duration(so.MaxHours * float64(time.Hour))))
+					elapsed := time.Since(deadline.Add(-time.Duration(so.MaxHours * float64(time.Hour))))
+					pct = float64(elapsed) / float64(total) * 100
+				}
+				if pct > 100 {
+					pct = 100
+				}
+				cb(speed, pct, "seeding", peers)
+			}
+			storage.UpdateState(jobName, "Seeding",
+				fmt.Sprintf("ratio %.3f / %.2f - %.2f MB/s up - %d peers", ratio, so.RatioTarget, speed, peers),
+				0)
+
+			if so.RatioTarget > 0 && ratio >= so.RatioTarget {
+				log.Printf("[%s] Seeding: ratio target %.2f reached (%.3f)", jobName, so.RatioTarget, ratio)
+				return
+			}
+			if !deadline.IsZero() && time.Now().After(deadline) {
+				log.Printf("[%s] Seeding: max time %.1fh elapsed (ratio %.3f)", jobName, so.MaxHours, ratio)
+				return
+			}
+		}
+	}
 }
 
 // ProgressCallback is called periodically with speed (MB/s), percent (0-100), and peer count.
@@ -173,6 +311,13 @@ type DownloadOpts struct {
 
 // downloadAndWait runs the download loop with progress reporting.
 func downloadAndWait(ctx context.Context, cl *torrent.Client, t *torrent.Torrent, dataDir string, jobName string, opts *DownloadOpts) (string, error) {
+	return downloadAndWaitSeed(ctx, cl, t, dataDir, jobName, opts, seedOpts{})
+}
+
+// downloadAndWaitSeed is the variant that also applies the torrent_*
+// layered settings: pre-start full-seed gate, zero-progress stall timeout,
+// and a post-download seeding phase bounded by ratio and/or hours.
+func downloadAndWaitSeed(ctx context.Context, cl *torrent.Client, t *torrent.Torrent, dataDir string, jobName string, opts *DownloadOpts, so seedOpts) (string, error) {
 	log.Printf("Downloading %s (%d bytes)...", t.Name(), t.Info().TotalLength())
 	t.DownloadAll()
 
@@ -187,6 +332,8 @@ func downloadAndWait(ctx context.Context, cl *torrent.Client, t *torrent.Torrent
 	total := t.Length()
 	var lastCompleted int64
 	var lastLog time.Time
+	startedAt := time.Now()
+	var stallSince time.Time
 
 	// Slow download tracking.
 	var slowSince time.Time
@@ -218,6 +365,11 @@ func downloadAndWait(ctx context.Context, cl *torrent.Client, t *torrent.Torrent
 			storage.UpdateState(jobName, "Downloading", "100% (Download Complete)", 100)
 			if cb := GetProgressCallback(jobName); cb != nil {
 				cb(0, 100, "downloading", 0)
+			}
+			// Enter the optional seeding phase. UploadKBps == 0 keeps the
+			// pre-existing behaviour of dropping the torrent immediately.
+			if so.UploadKBps > 0 && (so.RatioTarget > 0 || so.MaxHours > 0) {
+				runSeedPhase(ctx, t, jobName, so)
 			}
 			return filepath.Join(dataDir, t.Name()), nil
 		case <-ticker.C:
@@ -269,6 +421,29 @@ func downloadAndWait(ctx context.Context, cl *torrent.Client, t *torrent.Torrent
 						}
 					} else {
 						slowSince = time.Time{} // reset timer when speed recovers
+					}
+				}
+
+				// Full-seed gate + stall detection (torrent_* layered settings).
+				// If RequireFull is set, we treat the first 60s with zero
+				// progress as "no full peer reachable" and drop. Past that,
+				// StallMins minutes of zero progress + zero speed drops too.
+				if so.RequireFull && completed == 0 && time.Since(startedAt) > 60*time.Second {
+					log.Printf("[%s] Rejecting: no full seed (0 bytes after 60s)", jobName)
+					t.Drop()
+					return filepath.Join(dataDir, t.Name()), ErrSlowDownload
+				}
+				if so.StallMins > 0 && percent < 99 {
+					if speed == 0 {
+						if stallSince.IsZero() {
+							stallSince = time.Now()
+						} else if time.Since(stallSince) > time.Duration(so.StallMins)*time.Minute {
+							log.Printf("[%s] Rejecting stalled download: 0 speed for %v", jobName, time.Since(stallSince).Round(time.Second))
+							t.Drop()
+							return filepath.Join(dataDir, t.Name()), ErrSlowDownload
+						}
+					} else {
+						stallSince = time.Time{}
 					}
 				}
 

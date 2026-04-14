@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -190,6 +191,36 @@ func activeTaskCount() int {
 	return len(activeTasks)
 }
 
+// applyDirective runs a queued site directive (currently only write_config,
+// which edits config.yml on disk) and acks the outcome. Errors are reported
+// via ack so the site can surface them in the settings UI; the agent keeps
+// polling regardless.
+func applyDirective(cfg *config.Config, site *client.SiteClient, d client.Directive) {
+	switch d.Kind {
+	case "write_config":
+		var p client.WriteConfigPayload
+		if err := json.Unmarshal(d.Payload, &p); err != nil {
+			site.AckDirective(d.ID, "bad payload: "+err.Error())
+			return
+		}
+		if cfg.Layered == nil {
+			site.AckDirective(d.ID, "layered config not initialised")
+			return
+		}
+		written, err := cfg.Layered.WriteYml(p.Updates)
+		if err != nil {
+			site.AckDirective(d.ID, err.Error())
+			return
+		}
+		// Re-derive effective values so env/yml changes take effect now.
+		cfg.Refresh()
+		log.Printf("write_config directive %d applied: %v", d.ID, written)
+		site.AckDirective(d.ID, "")
+	default:
+		site.AckDirective(d.ID, "unknown directive kind: "+d.Kind)
+	}
+}
+
 // ── Main ────────────────────────────────────────────────────────────────────
 
 func main() {
@@ -210,6 +241,11 @@ func main() {
 	storage.LoadState()
 
 	go services.MonitorNetworkConnection(cfg)
+
+	// Secrets + optional local UI. Both are no-ops when the operator hasn't
+	// enabled them (LOCAL_UI_PORT unset, secrets.yml missing).
+	secrets := services.LoadSecrets()
+	localUI := services.StartLocalUI(cfg, secrets)
 
 	site := client.New(cfg)
 	pollInterval := time.Duration(cfg.PollInterval) * time.Second
@@ -254,6 +290,37 @@ func main() {
 			// Apply remote disk limit override.
 			if rc.MaxDiskUsageGB > 0 {
 				services.InitDiskLimit(rc.MaxDiskUsageGB)
+			}
+			// Layered web-override tier: only applied when the site provided
+			// an explicit WebOverrides map. Empty/nil leaves existing tier in
+			// place rather than clobbering it on every poll.
+			if rc.WebOverrides != nil && cfg.Layered != nil {
+				cfg.Layered.ApplyWeb(rc.WebOverrides)
+				cfg.Refresh()
+			}
+		}
+
+		// Best-effort: post our local config snapshot so the settings UI can
+		// render state badges, and drain any pending write_config directives
+		// the user queued from the site. Failures are non-fatal — the agent
+		// keeps polling for work regardless.
+		if cfg.Layered != nil {
+			extras := []config.ReportExtra{
+				config.WithPrivateTrackers(secrets.Has()),
+				config.WithLocalUIURL(localUI.URL()),
+			}
+			if err := site.PostLocalConfig(cfg.Layered.Report(extras...)); err != nil {
+				// Only log once per reason to avoid spamming on older sites
+				// that don't yet implement /api/agent/local-config.
+				if lastReason != "local_config_post" {
+					log.Printf("local-config post: %v (ok if site not yet upgraded)", err)
+					lastReason = "local_config_post"
+				}
+			}
+			if dirs, err := site.FetchDirectives(); err == nil {
+				for _, d := range dirs {
+					applyDirective(cfg, site, d)
+				}
 			}
 		}
 

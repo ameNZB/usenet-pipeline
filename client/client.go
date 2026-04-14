@@ -113,6 +113,9 @@ func (c *SiteClient) Poll() (*PollResult, error) {
 }
 
 // RemoteConfig holds server-side agent configuration fetched from the site.
+// WebOverrides is the key/value map from the agent_config_web table — only
+// keys present here are applied as the web tier on the agent's Layered
+// config (so a missing key falls through to env/yml).
 type RemoteConfig struct {
 	MaxConcurrent      int     `json:"max_concurrent"` // 0 = use local default
 	CpuMaxPercent      int     `json:"cpu_max_percent"`
@@ -121,6 +124,85 @@ type RemoteConfig struct {
 	SlowSpeedTimeout   int     `json:"slow_speed_timeout"`   // minutes
 	LowPeersThreshold  int     `json:"low_peers_threshold"`  // skip if seeds <= this
 	LowPeersTimeout    int     `json:"low_peers_timeout"`    // minutes
+	WebOverrides       map[string]string `json:"web_overrides,omitempty"`
+}
+
+// PostLocalConfig uploads the agent's local snapshot (yml + env values for
+// the known tunable keys) so the settings UI can show state badges and
+// compare against any web-override the user has set.
+func (c *SiteClient) PostLocalConfig(report config.SettingsReport) error {
+	body, _ := json.Marshal(report)
+	req, err := http.NewRequest("POST", c.baseURL+"/api/agent/local-config", bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+c.token)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return err
+	}
+	resp.Body.Close()
+	return nil
+}
+
+// Directive is a queued instruction from the site. Currently only
+// kind="write_config" with Payload.Updates (map[string]string) is defined.
+type Directive struct {
+	ID      int64           `json:"id"`
+	Kind    string          `json:"kind"`
+	Payload json.RawMessage `json:"payload"`
+}
+
+// WriteConfigPayload is the decoded payload for kind="write_config".
+type WriteConfigPayload struct {
+	Updates map[string]string `json:"updates"`
+}
+
+// FetchDirectives returns any pending directives queued for this agent.
+func (c *SiteClient) FetchDirectives() ([]Directive, error) {
+	req, err := http.NewRequest("GET", c.baseURL+"/api/agent/directives", nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+c.token)
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		// Site hasn't shipped the directives endpoint yet — treat as empty.
+		return nil, nil
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("directives returned %d", resp.StatusCode)
+	}
+	var out struct {
+		Directives []Directive `json:"directives"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, err
+	}
+	return out.Directives, nil
+}
+
+// AckDirective reports the outcome of a directive back to the site so the
+// row can be marked consumed. Err is empty on success.
+func (c *SiteClient) AckDirective(id int64, errMsg string) error {
+	body, _ := json.Marshal(map[string]interface{}{"id": id, "error": errMsg})
+	req, err := http.NewRequest("POST", c.baseURL+"/api/agent/directives/ack", bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+c.token)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return err
+	}
+	resp.Body.Close()
+	return nil
 }
 
 // GetConfig fetches the agent configuration from the site.

@@ -46,6 +46,8 @@ nano .env
 | `NNTP_USER` / `NNTP_PASS` | Usenet credentials |
 | `NNTP_GROUP` | Target newsgroup |
 | `NNTP_POSTER` | Poster identity (e.g. `agent <agent@your-domain.com>`) |
+| `NNTP_FROM` | From-header address for posted articles |
+| `NNTP_DOMAIN` | Domain used when generating Message-IDs |
 
 See [.env.example](.env.example) for the full list with descriptions.
 
@@ -134,6 +136,16 @@ Poll for next task
 
 In full-tunnel mode, all traffic goes through gluetun. In split-tunnel mode, only torrent traffic uses the VPN's SOCKS5 proxy.
 
+## Configuration Layers
+
+Settings come from three tiers, merged in this order (highest wins):
+
+1. **Web overrides** — pushed down from the site UI on each poll. Live-applied; no restart.
+2. **`.env` / process environment** — connection-sensitive values (site, NNTP, VPN credentials). Restart required.
+3. **`config.yml`** — on-disk tunables the agent can rewrite when you click "Save to agent config" in the UI.
+
+`config.yml` lives next to the agent (or at `$CONFIG_YML` / `$CONFIG_DIR/config.yml`). Keys in `.env` (VPN_*, NNTP_*, `SITE_URL`, `AGENT_TOKEN`) are never written into it. The agent reports its local snapshot on every poll so the site can show which tier each value came from.
+
 ## Web Dashboard Configuration
 
 Most settings can be changed from the site UI without restarting:
@@ -145,6 +157,10 @@ Most settings can be changed from the site UI without restarting:
 - **Torrent watch folder**: Monitor a directory for completed downloads
 - **Built-in FTP server**: Accept uploads directly
 
+## Local UI
+
+The agent also serves a small loopback-only page for editing secrets and on-disk config without the site. Enable by setting `LOCAL_UI_PORT`; bind beyond `127.0.0.1` with `LOCAL_UI_BIND` (not recommended). Auth token is stored in `secrets.yml` alongside any private-tracker passkeys — neither ever leaves the agent.
+
 ## Processing Options
 
 | Variable | Default | Description |
@@ -153,11 +169,39 @@ Most settings can be changed from the site UI without restarting:
 | `OBFUSCATE` | `false` | Rename files to random hex on Usenet |
 | `PAR2_REDUNDANCY` | `5` | Recovery block percentage |
 | `PAR2_THREADS` | `0` | CPU threads for PAR2 (0 = all) |
+| `PAR2_MEMORY_MB` | `0` | PAR2 memory cap in MB (0 = auto) |
 | `MAX_CONCURRENT_DOWNLOADS` | `3` | Parallel torrent downloads |
 | `MAX_DISK_USAGE_GB` | `0` | Disk cap (0 = no limit) |
 | `CPU_MAX_PERCENT` | `85` | Pause new tasks above this CPU % |
 | `SLOW_SPEED_THRESHOLD_MBS` | `0.05` | Reject downloads below this speed |
 | `SLOW_SPEED_TIMEOUT_MINS` | `10` | Minutes before slow rejection |
+| `GENERATOR_NAME` | `usenet-pipeline` | NZB `x-generator` header value |
+| `VPN_PROXY_ADDR` | `vpn:1080` | Gluetun SOCKS5 proxy address (split-tunnel) |
+| `DATA_DIR` | `./data` | Host dir for agent state, downloads, gluetun config |
+| `LOCAL_UI_PORT` | *(unset)* | Enable local UI on this port (loopback) |
+| `LOCAL_UI_BIND` | `127.0.0.1` | Address the local UI listens on |
+
+### Tunable via `config.yml` / web UI
+
+These live in `config.yml` (or are pushed from the site) rather than `.env`:
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `torrent_max_upload_kbps` | `0` | Per-torrent upload cap (0 = unlimited) |
+| `torrent_seed_ratio` | `0` | Stop seeding once this ratio is reached |
+| `torrent_seed_hours` | — | Stop seeding after this many hours |
+| `torrent_require_full_seed` | — | Wait for a full seed before considering complete |
+| `torrent_no_full_seed_timeout_mins` | — | Abort if no full seed within this window |
+| `torrent_port` | `0` | Torrent listen port (0 = random) |
+| `low_peers_threshold` | — | Skip torrents with ≤ this many seeders |
+| `low_peers_timeout_mins` | — | Minutes of sustained low peers before skip |
+| `max_concurrent_downloads` | `3` | Parallel torrent downloads |
+| `cpu_max_percent` | `85` | Pause new tasks above this CPU % |
+| `max_disk_usage_gb` | `0` | Disk cap (0 = no limit) |
+| `slow_speed_threshold_mbs` | `0.05` | Reject downloads below this speed |
+| `slow_speed_timeout_mins` | `10` | Minutes before slow rejection |
+| `local_ui_port` | *(unset)* | Local UI port |
+| `local_ui_bind` | `127.0.0.1` | Local UI bind address |
 
 ## Updating
 
