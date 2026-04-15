@@ -8,6 +8,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -221,6 +222,51 @@ func applyDirective(cfg *config.Config, site *client.SiteClient, d client.Direct
 	}
 }
 
+// runBackfill walks tempDir for backup-request-*.nzb files and re-submits
+// each one to the site via /api/agent/backfill. The site does the same
+// hash/dedup/insert/fulfill that Complete does. On success the local backup
+// file is deleted; on failure it stays put so the next agent restart will
+// retry. Designed to be safe to run repeatedly: dedup on the site means
+// re-submitting an already-ingested NZB just fulfills the request again
+// (idempotent).
+func runBackfill(site *client.SiteClient, tempDir string) {
+	matches, err := filepath.Glob(filepath.Join(tempDir, "backup-request-*.nzb"))
+	if err != nil || len(matches) == 0 {
+		return
+	}
+	log.Printf("Backfill: found %d local NZB backup(s) to re-submit", len(matches))
+
+	var ok, fail int
+	for _, path := range matches {
+		base := filepath.Base(path)
+		// Filename format: backup-request-<id>.nzb
+		idStr := strings.TrimSuffix(strings.TrimPrefix(base, "backup-request-"), ".nzb")
+		requestID, parseErr := strconv.ParseInt(idStr, 10, 64)
+		if parseErr != nil {
+			log.Printf("Backfill: skipping %s — cannot parse request ID: %v", base, parseErr)
+			continue
+		}
+		data, readErr := os.ReadFile(path)
+		if readErr != nil {
+			log.Printf("Backfill: cannot read %s: %v", base, readErr)
+			fail++
+			continue
+		}
+		nzbID, subErr := site.Backfill(requestID, data, "")
+		if subErr != nil {
+			log.Printf("Backfill: request=%d failed: %v (will retry on next start)", requestID, subErr)
+			fail++
+			continue
+		}
+		log.Printf("Backfill: request=%d → nzb=%d, removing %s", requestID, nzbID, base)
+		if rmErr := os.Remove(path); rmErr != nil {
+			log.Printf("Backfill: warn — could not remove %s: %v", path, rmErr)
+		}
+		ok++
+	}
+	log.Printf("Backfill: complete — %d ok, %d failed", ok, fail)
+}
+
 // ── Main ────────────────────────────────────────────────────────────────────
 
 func main() {
@@ -256,6 +302,12 @@ func main() {
 	} else if cleared > 0 {
 		log.Printf("Cleared %d stale lock(s) from previous run", cleared)
 	}
+
+	// Also on startup: scan for backup-request-*.nzb files left by previous
+	// failed Complete calls and re-submit them via /api/agent/backfill. Done
+	// before the polling loop starts so the user doesn't waste bandwidth
+	// re-downloading content the agent already has on disk.
+	go runBackfill(site, cfg.TempDir)
 
 	go startStatusReporter(site, cfg.TempDir)
 	go startSpeedLogger()
@@ -562,14 +614,25 @@ func processTask(cfg *config.Config, site *client.SiteClient, task *client.Agent
 
 	// Per-task progress callback for live dashboard.
 	var lastLockUpdate time.Time
-	progressCb := func(speedMBs float64, percent float64, phase string, peers int) {
-		updateTaskProgress(task.RequestID, &client.FileProgress{
+	progressCb := func(downMBs float64, upMBs float64, percent float64, phase string, peers int) {
+		// The "headline" speed for a single-string display is the dominant
+		// direction for the phase: upload speed during seeding/uploading,
+		// download speed otherwise.
+		headline := downMBs
+		if phase == "seeding" || phase == "uploading" {
+			headline = upMBs
+		}
+		fp := &client.FileProgress{
 			Name:    task.Title,
 			Percent: percent,
-			Speed:   fmt.Sprintf("%.2f MB/s", speedMBs),
+			Speed:   fmt.Sprintf("%.2f MB/s", downMBs),
 			Phase:   phase,
 			Peers:   peers,
-		})
+		}
+		if upMBs > 0 || phase == "seeding" || phase == "uploading" {
+			fp.UpSpeed = fmt.Sprintf("%.2f MB/s", upMBs)
+		}
+		updateTaskProgress(task.RequestID, fp)
 		// Throttle DB lock updates to every 10 seconds so the admin Active
 		// Tasks table stays current without hammering the site API.
 		if time.Since(lastLockUpdate) >= 10*time.Second {
@@ -577,12 +640,14 @@ func processTask(cfg *config.Config, site *client.SiteClient, task *client.Agent
 			label := "Downloading"
 			if phase == "uploading" {
 				label = "Uploading"
+			} else if phase == "seeding" {
+				label = "Seeding"
 			}
-			progress := fmt.Sprintf("%s: %.0f%% (%.1f MB/s)", label, percent, speedMBs)
+			progress := fmt.Sprintf("%s: %.0f%% (%.1f MB/s)", label, percent, headline)
 			if peers > 0 {
 				progress += fmt.Sprintf(" [%d peers]", peers)
 			}
-			_ = site.ReportProgress(task.LockID, progress, fmt.Sprintf("%.1f MB/s", speedMBs))
+			_ = site.ReportProgress(task.LockID, progress, fmt.Sprintf("%.1f MB/s", headline))
 		}
 	}
 

@@ -246,7 +246,7 @@ func runSeedPhase(ctx context.Context, t *torrent.Torrent, jobName string, so se
 	defer ticker.Stop()
 	log.Printf("[%s] Seeding: ratio target %.2f, max %.1fh, cap %d KB/s",
 		jobName, so.RatioTarget, so.MaxHours, so.UploadKBps)
-	var lastWritten int64
+	var lastUp, lastDown int64
 	for {
 		select {
 		case <-ctx.Done():
@@ -254,10 +254,13 @@ func runSeedPhase(ctx context.Context, t *torrent.Torrent, jobName string, so se
 			return
 		case <-ticker.C:
 			stats := t.Stats()
-			written := stats.BytesWrittenData.Int64()
-			ratio := float64(written) / float64(total)
-			speed := float64(written-lastWritten) / 2.0 / 1024 / 1024 // MB/s (2s tick)
-			lastWritten = written
+			uploaded := stats.BytesWrittenData.Int64()
+			downloaded := stats.BytesReadData.Int64()
+			ratio := float64(uploaded) / float64(total)
+			upSpeed := float64(uploaded-lastUp) / 2.0 / 1024 / 1024   // MB/s (2s tick)
+			dnSpeed := float64(downloaded-lastDown) / 2.0 / 1024 / 1024
+			lastUp = uploaded
+			lastDown = downloaded
 			peers := len(t.PeerConns())
 
 			// Surface seed progress through the existing callback so the
@@ -276,10 +279,10 @@ func runSeedPhase(ctx context.Context, t *torrent.Torrent, jobName string, so se
 				if pct > 100 {
 					pct = 100
 				}
-				cb(speed, pct, "seeding", peers)
+				cb(dnSpeed, upSpeed, pct, "seeding", peers)
 			}
 			storage.UpdateState(jobName, "Seeding",
-				fmt.Sprintf("ratio %.3f / %.2f - %.2f MB/s up - %d peers", ratio, so.RatioTarget, speed, peers),
+				fmt.Sprintf("ratio %.3f / %.2f - %.2f MB/s up - %d peers", ratio, so.RatioTarget, upSpeed, peers),
 				0)
 
 			if so.RatioTarget > 0 && ratio >= so.RatioTarget {
@@ -294,8 +297,11 @@ func runSeedPhase(ctx context.Context, t *torrent.Torrent, jobName string, so se
 	}
 }
 
-// ProgressCallback is called periodically with speed (MB/s), percent (0-100), and peer count.
-type ProgressCallback func(speedMBs float64, percent float64, phase string, peers int)
+// ProgressCallback is called periodically with download and upload speeds
+// (MB/s), percent (0-100), phase, and peer count. downMBs is the payload
+// receive rate; upMBs is the payload send rate (peer uploads during a torrent
+// phase, or NNTP upload rate during the usenet phase).
+type ProgressCallback func(downMBs float64, upMBs float64, percent float64, phase string, peers int)
 
 // ErrSlowDownload is returned when a download is rejected for being too slow.
 var ErrSlowDownload = fmt.Errorf("download rejected: speed too low for too long")
@@ -331,6 +337,7 @@ func downloadAndWaitSeed(ctx context.Context, cl *torrent.Client, t *torrent.Tor
 	defer ticker.Stop()
 	total := t.Length()
 	var lastCompleted int64
+	var lastUploaded int64
 	var lastLog time.Time
 	startedAt := time.Now()
 	var stallSince time.Time
@@ -364,7 +371,7 @@ func downloadAndWaitSeed(ctx context.Context, cl *torrent.Client, t *torrent.Tor
 		case <-done:
 			storage.UpdateState(jobName, "Downloading", "100% (Download Complete)", 100)
 			if cb := GetProgressCallback(jobName); cb != nil {
-				cb(0, 100, "downloading", 0)
+				cb(0, 0, 100, "downloading", 0)
 			}
 			// Enter the optional seeding phase. UploadKBps == 0 keeps the
 			// pre-existing behaviour of dropping the torrent immediately.
@@ -375,9 +382,12 @@ func downloadAndWaitSeed(ctx context.Context, cl *torrent.Client, t *torrent.Tor
 		case <-ticker.C:
 			completed := t.BytesCompleted()
 			peers := len(t.PeerConns())
+			dlStats := t.Stats()
+			uploaded := dlStats.BytesWrittenData.Int64()
 			if total > 0 {
 				percent := float64(completed) / float64(total) * 100
 				speed := float64(completed-lastCompleted) / 1024 / 1024
+				upSpeed := float64(uploaded-lastUploaded) / 1024 / 1024
 
 				etaStr := "Calculating..."
 				if speed > 0 {
@@ -387,10 +397,11 @@ func downloadAndWaitSeed(ctx context.Context, cl *torrent.Client, t *torrent.Tor
 				}
 
 				lastCompleted = completed
-				storage.UpdateState(jobName, "Downloading", fmt.Sprintf("%.1f%% (%.2f / %.2f MB) - %.2f MB/s - ETA: %s - %d peers", percent, float64(completed)/1024/1024, float64(total)/1024/1024, speed, etaStr, peers), percent)
+				lastUploaded = uploaded
+				storage.UpdateState(jobName, "Downloading", fmt.Sprintf("%.1f%% (%.2f / %.2f MB) - %.2f MB/s dn / %.2f MB/s up - ETA: %s - %d peers", percent, float64(completed)/1024/1024, float64(total)/1024/1024, speed, upSpeed, etaStr, peers), percent)
 
 				if cb := GetProgressCallback(jobName); cb != nil {
-					cb(speed, percent, "downloading", peers)
+					cb(speed, upSpeed, percent, "downloading", peers)
 				}
 
 				// Periodic log so stdout isn't silent during long downloads.

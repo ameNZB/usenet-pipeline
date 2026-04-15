@@ -245,7 +245,7 @@ func UploadToUsenet(ctx context.Context, cfg *config.Config, filePath string, su
 		storage.UpdateState(jobName, "Uploading", fmt.Sprintf("%.1f%% - %.2f MB/s - ETA: %s", overallPercent, speed, etaStr), overallPercent)
 
 		if cb := GetProgressCallback(jobName); cb != nil {
-			cb(speed, overallPercent, "uploading", 0)
+			cb(0, speed, overallPercent, "uploading", 0)
 		}
 	}
 

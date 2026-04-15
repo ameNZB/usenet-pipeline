@@ -307,6 +307,7 @@ type FileProgress struct {
 	Transferred int64   `json:"transferred"`
 	Percent     float64 `json:"percent"`
 	Speed       string  `json:"speed,omitempty"`
+	UpSpeed     string  `json:"up_speed,omitempty"`
 	Phase       string  `json:"phase"`
 	Peers       int     `json:"peers,omitempty"`
 }
@@ -466,6 +467,39 @@ func (c *SiteClient) buildCompleteForm(result CompleteResult, screenshots []scre
 	ct := w.FormDataContentType()
 	w.Close()
 	return buf, ct
+}
+
+// Backfill re-submits an NZB from a local backup file (e.g. one written by
+// the agent when the original Complete call to the site failed). The site
+// performs the same hash/dedup/insert/fulfill flow as Complete but doesn't
+// require a lock_id. Returns the resulting nzb_id on success.
+func (c *SiteClient) Backfill(requestID int64, nzbData []byte, password string) (int64, error) {
+	var buf bytes.Buffer
+	w := multipart.NewWriter(&buf)
+	w.WriteField("request_id", fmt.Sprintf("%d", requestID))
+	if password != "" {
+		w.WriteField("password", password)
+	}
+	if part, err := w.CreateFormFile("nzb_data", "release.nzb"); err == nil {
+		part.Write(nzbData)
+	}
+	ct := w.FormDataContentType()
+	w.Close()
+
+	resp, err := c.postGzipped(c.baseURL+"/api/agent/backfill", buf.Bytes(), ct)
+	if err != nil {
+		return 0, err
+	}
+	if v, ok := resp["nzb_id"]; ok {
+		switch n := v.(type) {
+		case float64:
+			return int64(n), nil
+		case json.Number:
+			id, _ := n.Int64()
+			return id, nil
+		}
+	}
+	return 0, nil
 }
 
 // postGzipped gzip-compresses body and POSTs it with auth headers.
