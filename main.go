@@ -30,6 +30,72 @@ var (
 	taskProgress   = map[int64]*client.FileProgress{} // keyed by request ID
 )
 
+// ── Agent-local error backoff ───────────────────────────────────────────────
+//
+// When the agent hits an error that's clearly about the local environment
+// rather than the torrent itself (port bind failure, disk full, VPN proxy
+// unreachable), we release the lock back to the pool with status="aborted"
+// instead of "failed" — the site treats aborted as non-punitive and the
+// request is immediately claimable again, by this agent or any other.
+//
+// If those errors *keep* happening, though, we don't want to churn through
+// the entire queue burning one task after another. After N consecutive
+// aborts we pause task polling for a few minutes so the operator has a
+// chance to fix the environment before more tasks are touched.
+var (
+	abortCounterMu    sync.Mutex
+	consecutiveAborts int
+	abortPauseUntil   time.Time
+)
+
+const (
+	abortPauseThreshold = 5
+	abortPauseDuration  = 5 * time.Minute
+)
+
+func recordAbort(reason string) {
+	abortCounterMu.Lock()
+	defer abortCounterMu.Unlock()
+	consecutiveAborts++
+	if consecutiveAborts >= abortPauseThreshold {
+		abortPauseUntil = time.Now().Add(abortPauseDuration)
+		log.Printf("Agent self-pause: %d consecutive agent-local errors (last: %s) — pausing task polls for %s",
+			consecutiveAborts, reason, abortPauseDuration)
+	}
+}
+
+func recordSuccess() {
+	abortCounterMu.Lock()
+	consecutiveAborts = 0
+	abortCounterMu.Unlock()
+}
+
+func abortPauseRemaining() time.Duration {
+	abortCounterMu.Lock()
+	defer abortCounterMu.Unlock()
+	if d := time.Until(abortPauseUntil); d > 0 {
+		return d
+	}
+	return 0
+}
+
+// isAgentLocalError returns true for errors that are about the agent's own
+// environment (port conflict, disk space, proxy reachability) rather than
+// anything wrong with the torrent. These should release the lock without
+// marking the request as failed for this agent.
+func isAgentLocalError(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := err.Error()
+	return strings.Contains(s, "address already in use") ||
+		strings.Contains(s, "Only one usage of each socket") ||
+		strings.Contains(s, "no space left") ||
+		strings.Contains(s, "insufficient disk space") ||
+		strings.Contains(s, "SOCKS5") ||
+		strings.Contains(s, "failed to create SOCKS5")
+}
+
 func setLivePhase(phase string) {
 	liveStatusMu.Lock()
 	liveStatus.Phase = phase
@@ -410,8 +476,35 @@ func main() {
 			}
 		}
 
+		// Self-pause after repeated agent-local errors (see recordAbort).
+		if wait := abortPauseRemaining(); wait > 0 {
+			if lastReason != "abort_pause" {
+				log.Printf("Skipping task polls for %s (self-pause after repeated local errors)", wait.Round(time.Second))
+				site.PostLog("warn", fmt.Sprintf("Self-pause: %s remaining after repeated agent-local errors", wait.Round(time.Second)))
+				lastReason = "abort_pause"
+			}
+			time.Sleep(pollInterval)
+			continue
+		}
+		if lastReason == "abort_pause" {
+			lastReason = ""
+		}
+
 		result, err := site.Poll()
 		if err != nil {
+			// Upgrade required: this agent's protocol is below the site's
+			// minimum. No amount of retrying will fix this — log loudly,
+			// tell the user, and back off so we're not spamming a clearly
+			// broken endpoint.
+			if ue, ok := client.IsUpgradeRequired(err); ok {
+				if lastReason != "upgrade" {
+					log.Printf("AGENT UPGRADE REQUIRED: %s", ue.Error())
+					site.PostLog("error", "Agent upgrade required: "+ue.Error())
+					lastReason = "upgrade"
+				}
+				time.Sleep(10 * time.Minute)
+				continue
+			}
 			// Maintenance: sleep the ETA + a small buffer, don't spam logs.
 			if me, ok := client.IsMaintenanceError(err); ok {
 				wait := time.Duration(me.Info.ETASeconds+15) * time.Second
@@ -603,12 +696,29 @@ func processTask(cfg *config.Config, site *client.SiteClient, task *client.Agent
 	}
 
 	fail := func(phase, msg string, err error) {
+		reason := msg + ": " + err.Error()
 		log.Printf("[%d] %s: %v", task.RequestID, phase, err)
-		reportProgress("Failed", msg+": "+err.Error())
+		// Agent-local errors (port bind, disk full, proxy down) aren't the
+		// torrent's fault — release the lock without burning a cooldown,
+		// and increment the self-pause counter so repeated failures
+		// eventually back off instead of churning the whole queue.
+		if isAgentLocalError(err) {
+			reportProgress("Aborted", reason)
+			_ = site.Complete(client.CompleteResult{
+				LockID:     task.LockID,
+				RequestID:  task.RequestID,
+				Status:     "aborted",
+				FailReason: reason,
+			})
+			recordAbort(reason)
+			return
+		}
+		reportProgress("Failed", reason)
 		_ = site.Complete(client.CompleteResult{
-			LockID:    task.LockID,
-			RequestID: task.RequestID,
-			Status:    "failed",
+			LockID:     task.LockID,
+			RequestID:  task.RequestID,
+			Status:     "failed",
+			FailReason: reason,
 		})
 	}
 
@@ -696,7 +806,20 @@ func processTask(cfg *config.Config, site *client.SiteClient, task *client.Agent
 			}
 		}
 		var err error
-		downloadedPath, err = services.DownloadMagnet(ctx, magnet, cfg, jobName, dlOpts)
+		if task.Private && task.TorrentFileURL != "" {
+			// Private upload: the site has the .torrent bytes. Fetch them
+			// over HTTPS and run the file-based download path so we never
+			// hit DHT with this info hash (which would leak the release
+			// off the user's private tracker).
+			log.Printf("[%d] Fetching private .torrent from %s", task.RequestID, task.TorrentFileURL)
+			var blob []byte
+			blob, err = site.FetchTorrentFile(task.TorrentFileURL)
+			if err == nil && len(blob) > 0 {
+				downloadedPath, err = services.DownloadPrivateTorrentBytes(ctx, blob, cfg, jobName, dlOpts)
+			}
+		} else {
+			downloadedPath, err = services.DownloadMagnet(ctx, magnet, cfg, jobName, dlOpts)
+		}
 
 		services.ClearProgressCallbackForJob(jobName)
 
@@ -705,17 +828,19 @@ func processTask(cfg *config.Config, site *client.SiteClient, task *client.Agent
 				log.Printf("[%d] Slow download rejected — skipping", task.RequestID)
 				reportProgress("Failed", "Download too slow — skipping")
 				_ = site.Complete(client.CompleteResult{
-					LockID:    task.LockID,
-					RequestID: task.RequestID,
-					Status:    "failed",
+					LockID:     task.LockID,
+					RequestID:  task.RequestID,
+					Status:     "failed",
+					FailReason: "Download too slow — skipping",
 				})
 			} else if ctx.Err() != nil {
 				log.Printf("[%d] Task skipped by user", task.RequestID)
 				reportProgress("Skipped", "Task skipped by user")
 				_ = site.Complete(client.CompleteResult{
-					LockID:    task.LockID,
-					RequestID: task.RequestID,
-					Status:    "failed",
+					LockID:     task.LockID,
+					RequestID:  task.RequestID,
+					Status:     "failed",
+					FailReason: "Task skipped by user",
 				})
 			} else {
 				fail("Download", "Download error", err)
@@ -988,4 +1113,5 @@ func processTask(cfg *config.Config, site *client.SiteClient, task *client.Agent
 
 	log.Printf("[%d] ── Pipeline complete: %s (total %s) ──", rid, task.Title, time.Since(taskStart).Round(time.Second))
 	storage.UpdateState(jobName, "Completed", "Uploaded and reported to site.", 100)
+	recordSuccess()
 }

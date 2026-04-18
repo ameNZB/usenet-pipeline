@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 	"github.com/ameNZB/usenet-pipeline/config"
 )
@@ -27,6 +28,14 @@ type AgentTask struct {
 	Season     string `json:"season,omitempty"`
 	Episodes   string `json:"episodes,omitempty"`
 	BoostCount int    `json:"boost_count,omitempty"`
+
+	// Private tells the agent to fetch the .torrent file from
+	// TorrentFileURL (a site-relative path) instead of resolving the info
+	// hash via magnet/DHT. Set by the site when the uploading user marked
+	// the request as private — the agent must also skip any public-tracker
+	// injection to keep private-tracker passkeys from leaking.
+	Private        bool   `json:"private,omitempty"`
+	TorrentFileURL string `json:"torrent_file_url,omitempty"`
 }
 
 // SiteClient communicates with the indexer site via HTTP.
@@ -36,13 +45,72 @@ type SiteClient struct {
 	http    *http.Client
 }
 
+// versionHeaderTransport adds X-Agent-Protocol and X-Agent-Version to every
+// outbound request so the site can gate agents below its required minimum
+// protocol version. Wrapping the transport keeps the header plumbing out of
+// every individual request builder in this package.
+type versionHeaderTransport struct {
+	inner http.RoundTripper
+}
+
+func (t *versionHeaderTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	req.Header.Set("X-Agent-Protocol", fmt.Sprintf("%d", AgentProtocolVersion))
+	req.Header.Set("X-Agent-Version", AgentVersion)
+	return t.inner.RoundTrip(req)
+}
+
 // New creates a SiteClient from config.
 func New(cfg *config.Config) *SiteClient {
 	return &SiteClient{
 		baseURL: cfg.SiteURL,
 		token:   cfg.AgentToken,
-		http:    &http.Client{Timeout: 120 * time.Second},
+		http: &http.Client{
+			Timeout:   120 * time.Second,
+			Transport: &versionHeaderTransport{inner: http.DefaultTransport},
+		},
 	}
+}
+
+// UpgradeRequiredError is returned when the site refuses the agent because
+// its reported X-Agent-Protocol is below the site's minimum. The operator
+// should update the binary; there is no retry loop that can recover from
+// this on its own.
+type UpgradeRequiredError struct {
+	MinProtocol int
+	Message     string
+}
+
+func (e *UpgradeRequiredError) Error() string {
+	return fmt.Sprintf("agent upgrade required: site needs protocol v%d (this agent is v%d) — %s",
+		e.MinProtocol, AgentProtocolVersion, e.Message)
+}
+
+// IsUpgradeRequired reports whether err is an UpgradeRequiredError.
+func IsUpgradeRequired(err error) (*UpgradeRequiredError, bool) {
+	var ue *UpgradeRequiredError
+	if errors.As(err, &ue) {
+		return ue, true
+	}
+	return nil, false
+}
+
+// parseUpgradeRequired decodes a 426 response body into an UpgradeRequiredError.
+// Accepts {"min_protocol":N,"message":"..."} or falls back to the raw body.
+func parseUpgradeRequired(body []byte) *UpgradeRequiredError {
+	var m struct {
+		MinProtocol int    `json:"min_protocol"`
+		Message     string `json:"message"`
+		Error       string `json:"error"`
+	}
+	_ = json.Unmarshal(body, &m)
+	msg := m.Message
+	if msg == "" {
+		msg = m.Error
+	}
+	if msg == "" {
+		msg = string(body)
+	}
+	return &UpgradeRequiredError{MinProtocol: m.MinProtocol, Message: msg}
 }
 
 // PollResult holds the response from a poll request.
@@ -75,6 +143,10 @@ func (c *SiteClient) Poll() (*PollResult, error) {
 	if resp.StatusCode == http.StatusForbidden {
 		body, _ := io.ReadAll(resp.Body)
 		return nil, fmt.Errorf("BLOCKED: %s (approve new IP in Account Settings on the site)", body)
+	}
+	if resp.StatusCode == http.StatusUpgradeRequired {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, parseUpgradeRequired(body)
 	}
 	if resp.StatusCode == http.StatusServiceUnavailable {
 		body, _ := io.ReadAll(resp.Body)
@@ -110,6 +182,38 @@ func (c *SiteClient) Poll() (*PollResult, error) {
 	}
 	task := raw.AgentTask
 	return &PollResult{Task: &task}, nil
+}
+
+// FetchTorrentFile downloads a .torrent file from the site. urlPath is the
+// path returned in AgentTask.TorrentFileURL (e.g. "/api/agent/torrent/42").
+// Absolute URLs are also accepted, in case the site ever starts returning
+// them. The Authorization header is attached so the site can re-verify the
+// caller owns the referenced lock.
+func (c *SiteClient) FetchTorrentFile(urlPath string) ([]byte, error) {
+	fullURL := urlPath
+	if !strings.HasPrefix(fullURL, "http://") && !strings.HasPrefix(fullURL, "https://") {
+		fullURL = c.baseURL + fullURL
+	}
+	req, err := http.NewRequest("GET", fullURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+c.token)
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, fmt.Errorf("torrent file not found (site returned 404 — lock may have expired)")
+	}
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("torrent fetch returned %d: %s", resp.StatusCode, body)
+	}
+	// Bound the read so a malicious or corrupted site response can't eat
+	// all our memory. 10 MB matches the server-side upload cap.
+	return io.ReadAll(io.LimitReader(resp.Body, 10<<20))
 }
 
 // RemoteConfig holds server-side agent configuration fetched from the site.
@@ -342,6 +446,7 @@ type CompleteResult struct {
 	LockID      int
 	RequestID   int64
 	Status      string // "completed" or "failed"
+	FailReason  string // human-readable reason when Status == "failed"
 	NzbData     []byte
 	Password    string
 	MediaInfo   interface{} // *services.VideoInfo — JSON-serialized
@@ -437,6 +542,9 @@ func (c *SiteClient) buildCompleteForm(result CompleteResult, screenshots []scre
 	w.WriteField("lock_id", fmt.Sprintf("%d", result.LockID))
 	w.WriteField("request_id", fmt.Sprintf("%d", result.RequestID))
 	w.WriteField("status", result.Status)
+	if result.FailReason != "" {
+		w.WriteField("fail_reason", result.FailReason)
+	}
 	if result.Password != "" {
 		w.WriteField("password", result.Password)
 	}

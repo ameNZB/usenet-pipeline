@@ -102,8 +102,60 @@ func applyVPNProxy(clientConfig *torrent.ClientConfig, cfg *config.Config) {
 	log.Printf("VPN split-tunnel: torrent traffic routed via SOCKS5 proxy %s", cfg.VPNProxyAddr)
 }
 
+// newTorrentClient creates a torrent.Client, and if the first attempt fails
+// with a "port already in use" error (either because torrent_port was pinned
+// to a busy port or a previous client's socket is still in TIME_WAIT), it
+// retries once with ListenPort=0 so the OS picks a fresh random port. Every
+// other error is returned unchanged.
+func newTorrentClient(clientConfig *torrent.ClientConfig) (*torrent.Client, error) {
+	client, err := torrent.NewClient(clientConfig)
+	if err == nil {
+		return client, nil
+	}
+	if !isBindInUseError(err) {
+		return nil, err
+	}
+	log.Printf("torrent client bind failed on port %d (%v) — retrying with random port", clientConfig.ListenPort, err)
+	clientConfig.ListenPort = 0
+	return torrent.NewClient(clientConfig)
+}
+
+// isBindInUseError returns true if err looks like an "address already in use"
+// bind failure from the torrent library's listener setup. Match is on string
+// substrings because the library wraps the underlying OS error several levels
+// deep ("first listen: listen tcp4 :NNNN: bind: address already in use").
+func isBindInUseError(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := err.Error()
+	return strings.Contains(s, "address already in use") ||
+		strings.Contains(s, "Only one usage of each socket address")
+}
+
+// DownloadPrivateTorrentBytes runs the .torrent-file download path against a
+// blob the site handed us (from a private upload). The bytes are staged to
+// a temp file so we can reuse the existing AddTorrentFromFile pipeline, and
+// we force DHT off on the client so the info hash never leaves the private
+// tracker's swarm even if the .torrent forgot to set info.private = 1.
+func DownloadPrivateTorrentBytes(ctx context.Context, torrentBytes []byte, cfg *config.Config, jobName string, opts *DownloadOpts) (string, error) {
+	tempPath := filepath.Join(cfg.TempDir, "dl-"+jobName+".torrent")
+	if err := os.MkdirAll(filepath.Dir(tempPath), 0755); err != nil {
+		return "", fmt.Errorf("create temp dir: %w", err)
+	}
+	if err := os.WriteFile(tempPath, torrentBytes, 0644); err != nil {
+		return "", fmt.Errorf("stage .torrent file: %w", err)
+	}
+	defer os.Remove(tempPath)
+	return downloadTorrentFile(ctx, tempPath, cfg, jobName, true)
+}
+
 // DownloadTorrent handles adding a torrent file and downloading its contents.
 func DownloadTorrent(ctx context.Context, torrentPath string, cfg *config.Config, jobName string) (string, error) {
+	return downloadTorrentFile(ctx, torrentPath, cfg, jobName, false)
+}
+
+func downloadTorrentFile(ctx context.Context, torrentPath string, cfg *config.Config, jobName string, privateMode bool) (string, error) {
 	dataDir := filepath.Join(cfg.TempDir, "dl-"+jobName)
 	if err := os.MkdirAll(dataDir, 0755); err != nil {
 		return "", fmt.Errorf("create download dir: %w", err)
@@ -115,6 +167,14 @@ func DownloadTorrent(ctx context.Context, torrentPath string, cfg *config.Config
 	clientConfig.DisableIPv6 = true
 	clientConfig.NoDefaultPortForwarding = true
 	clientConfig.ListenPort = so.ListenPort // 0 = random
+	if privateMode {
+		// Private-tracker torrents must not leak their info hash to DHT
+		// or trade peers over PEX/LSD. anacrolix honors info.private=1 in
+		// the .torrent automatically, but we force it here too as a
+		// belt-and-suspenders — even a mis-flagged .torrent stays
+		// contained to the private tracker's swarm.
+		clientConfig.NoDHT = true
+	}
 	if so.UploadKBps > 0 {
 		// burst = 1s worth of tokens keeps the limiter responsive without
 		// starving bursty writers. Values are bytes/sec, not bits.
@@ -122,7 +182,7 @@ func DownloadTorrent(ctx context.Context, torrentPath string, cfg *config.Config
 	}
 	applyVPNProxy(clientConfig, cfg)
 
-	client, err := torrent.NewClient(clientConfig)
+	client, err := newTorrentClient(clientConfig)
 	if err != nil {
 		return "", err
 	}
@@ -150,10 +210,27 @@ var publicTrackers = []string{
 }
 
 func DownloadMagnet(ctx context.Context, magnetURI string, cfg *config.Config, jobName string, opts *DownloadOpts) (string, error) {
-	// Append public trackers if not already present.
-	for _, tr := range publicTrackers {
-		if !strings.Contains(magnetURI, tr) {
-			magnetURI += "&tr=" + url.QueryEscape(tr)
+	return downloadMagnet(ctx, magnetURI, cfg, jobName, opts, false)
+}
+
+// DownloadPrivateMagnet is like DownloadMagnet but skips the public-tracker
+// injection — required for private-tracker torrents where announcing to the
+// public trackers would leak the release to strangers and risk the user's
+// tracker account. Private .torrent files already carry their own (private)
+// announce list; we use that alone.
+func DownloadPrivateMagnet(ctx context.Context, magnetURI string, cfg *config.Config, jobName string, opts *DownloadOpts) (string, error) {
+	return downloadMagnet(ctx, magnetURI, cfg, jobName, opts, true)
+}
+
+func downloadMagnet(ctx context.Context, magnetURI string, cfg *config.Config, jobName string, opts *DownloadOpts, privateMode bool) (string, error) {
+	// Append public trackers if not already present — but never for private
+	// torrents, where announcing to the public trackers would de-anonymize
+	// the user's private-tracker traffic.
+	if !privateMode {
+		for _, tr := range publicTrackers {
+			if !strings.Contains(magnetURI, tr) {
+				magnetURI += "&tr=" + url.QueryEscape(tr)
+			}
 		}
 	}
 
@@ -177,7 +254,7 @@ func DownloadMagnet(ctx context.Context, magnetURI string, cfg *config.Config, j
 	}
 	applyVPNProxy(clientConfig, cfg)
 
-	client, err := torrent.NewClient(clientConfig)
+	client, err := newTorrentClient(clientConfig)
 	if err != nil {
 		return "", err
 	}
