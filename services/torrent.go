@@ -2,6 +2,7 @@ package services
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -20,6 +21,12 @@ import (
 	"golang.org/x/net/proxy"
 	"golang.org/x/time/rate"
 )
+
+// ErrInsufficientDisk is returned by the pre-flight capacity check when a
+// specific torrent won't fit on this agent. Callers use errors.Is to detect
+// this case and skip the self-pause counter — one oversized torrent
+// shouldn't pause the whole queue when smaller ones could still succeed.
+var ErrInsufficientDisk = errors.New("insufficient disk space")
 
 // layeredInt pulls a whole-number setting from the layered config; returns
 // the fallback when the key is unset or not parseable.
@@ -286,7 +293,8 @@ func downloadMagnet(ctx context.Context, magnetURI string, cfg *config.Config, j
 		log.Printf("Warning: could not check disk space: %v", err)
 	} else if effective < uint64(requiredBytes) {
 		t.Drop()
-		return "", fmt.Errorf("insufficient disk space: need %.1f GB (%.1fx %.1f GB torrent), have %.1f GB effective free",
+		return "", fmt.Errorf("%w: need %.1f GB (%.1fx %.1f GB torrent), have %.1f GB effective free",
+			ErrInsufficientDisk,
 			float64(requiredBytes)/1e9, DiskMultiplier,
 			float64(torrentSize)/1e9,
 			float64(effective)/1e9)

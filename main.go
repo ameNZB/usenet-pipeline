@@ -51,6 +51,12 @@ var (
 const (
 	abortPauseThreshold = 5
 	abortPauseDuration  = 5 * time.Minute
+	// oversizeSkipTTL is how long we remember "this request doesn't fit on
+	// this agent" so we don't re-claim and re-fetch metadata for it every
+	// poll. Long enough that the site will usually route it elsewhere or
+	// the operator will notice, short enough that a disk-space change
+	// (another task finishing) unblocks it.
+	oversizeSkipTTL = 30 * time.Minute
 )
 
 func recordAbort(reason string) {
@@ -62,6 +68,35 @@ func recordAbort(reason string) {
 		log.Printf("Agent self-pause: %d consecutive agent-local errors (last: %s) — pausing task polls for %s",
 			consecutiveAborts, reason, abortPauseDuration)
 	}
+}
+
+// oversizeSkip tracks request IDs that failed the pre-flight disk check, so
+// we can decline to re-download their metadata if the site hands the same
+// task back immediately. In-memory only — resets on restart, which is fine
+// because the sweep also runs then.
+var (
+	oversizeSkipMu sync.Mutex
+	oversizeSkip   = map[int64]time.Time{}
+)
+
+func markOversize(requestID int64) {
+	oversizeSkipMu.Lock()
+	oversizeSkip[requestID] = time.Now().Add(oversizeSkipTTL)
+	oversizeSkipMu.Unlock()
+}
+
+func shouldSkipOversize(requestID int64) bool {
+	oversizeSkipMu.Lock()
+	defer oversizeSkipMu.Unlock()
+	exp, ok := oversizeSkip[requestID]
+	if !ok {
+		return false
+	}
+	if time.Now().After(exp) {
+		delete(oversizeSkip, requestID)
+		return false
+	}
+	return true
 }
 
 func recordSuccess() {
@@ -351,6 +386,11 @@ func main() {
 
 	storage.StateFile = filepath.Join(cfg.TempDir, "state.json")
 	storage.LoadState()
+
+	// Remove any dl-* directories left behind by crashed/aborted tasks.
+	// Must run after LoadState so the resumable set is known, and before
+	// the polling loop so free-space checks see an accurate disk picture.
+	services.SweepOrphanDownloads(cfg.TempDir)
 
 	go services.MonitorNetworkConnection(cfg)
 
@@ -681,6 +721,21 @@ func dirSize(path string) int64 {
 
 func processTask(cfg *config.Config, site *client.SiteClient, task *client.AgentTask, remoteCfg *client.RemoteConfig) {
 	jobName := fmt.Sprintf("request-%d", task.RequestID)
+
+	// If we just rejected this exact request for insufficient disk, the
+	// site may hand it right back. Fail fast: releasing the lock without
+	// fetching metadata saves a 2-minute DHT round-trip per re-dispatch.
+	if shouldSkipOversize(task.RequestID) {
+		log.Printf("[%d] Skipping re-dispatched oversized task (still within cooldown)", task.RequestID)
+		_ = site.Complete(client.CompleteResult{
+			LockID:     task.LockID,
+			RequestID:  task.RequestID,
+			Status:     "aborted",
+			FailReason: "too large for this agent (cooldown)",
+		})
+		return
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 	storage.JobCancels.Store(jobName, cancel)
 	defer storage.JobCancels.Delete(jobName)
@@ -698,6 +753,22 @@ func processTask(cfg *config.Config, site *client.SiteClient, task *client.Agent
 	fail := func(phase, msg string, err error) {
 		reason := msg + ": " + err.Error()
 		log.Printf("[%d] %s: %v", task.RequestID, phase, err)
+		// Pre-flight disk shortfall is per-torrent, not environmental: a
+		// 90 GB torrent not fitting tells us nothing about whether a 5 GB
+		// one will. Abort the task back to the pool but skip the
+		// self-pause counter, and remember the request ID briefly so we
+		// don't re-fetch its metadata if the site hands it right back.
+		if errors.Is(err, services.ErrInsufficientDisk) {
+			reportProgress("Aborted", reason)
+			_ = site.Complete(client.CompleteResult{
+				LockID:     task.LockID,
+				RequestID:  task.RequestID,
+				Status:     "aborted",
+				FailReason: reason,
+			})
+			markOversize(task.RequestID)
+			return
+		}
 		// Agent-local errors (port bind, disk full, proxy down) aren't the
 		// torrent's fault — release the lock without burning a cooldown,
 		// and increment the self-pause counter so repeated failures
@@ -898,6 +969,25 @@ func processTask(cfg *config.Config, site *client.SiteClient, task *client.Agent
 				screenshots = shots
 				log.Printf("[%d] Generated %d screenshots", rid, len(shots))
 			}
+		}
+	} else if archive := services.FindMangaArchive(downloadedPath); archive != "" {
+		// Manga path: no video file, but there's a CBZ/EPUB. Extract 6
+		// sample pages using the same screenshot upload pipeline — the
+		// site stores/renders them identically to video stills.
+		log.Printf("[%d] Step 2: Found manga archive: %s", rid, filepath.Base(archive))
+		reportProgress("Screenshots", "Extracting preview pages...")
+		updateTaskProgress(task.RequestID, &client.FileProgress{
+			Name: task.Title, Phase: "screenshots",
+		})
+		screenDir := filepath.Join(cfg.TempDir, "screens-"+services.GenerateRandomPassword(8))
+		defer os.RemoveAll(screenDir)
+
+		shots, err := services.GenerateMangaScreenshots(ctx, archive, screenDir, 6)
+		if err != nil {
+			log.Printf("[%d] Manga screenshot warning (non-fatal): %v", rid, err)
+		} else {
+			screenshots = shots
+			log.Printf("[%d] Extracted %d manga pages", rid, len(shots))
 		}
 	}
 

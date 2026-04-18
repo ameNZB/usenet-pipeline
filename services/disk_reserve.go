@@ -4,8 +4,11 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
+
+	"github.com/ameNZB/usenet-pipeline/storage"
 )
 
 // diskReserved tracks the total bytes reserved by all in-flight tasks.
@@ -116,4 +119,63 @@ func diskUsage(path string) uint64 {
 // TotalReservedBytes returns the current total reservation for logging.
 func TotalReservedBytes() int64 {
 	return atomic.LoadInt64(&diskReserved)
+}
+
+// SweepOrphanDownloads removes stale dl-* entries in tempDir left behind by
+// crashed, aborted, or force-killed tasks. Called once at startup after
+// storage.LoadState so the in-memory job map is populated.
+//
+// A dl-* directory is preserved only if some job state still references it
+// as a DownloadedPath — that's the exact condition the resume path in
+// processTask checks, so anything not in that set can never be resumed
+// and is just wasted disk.
+//
+// The per-download outer dir TempDir/dl-{jobName}/ never gets cleaned by
+// processTask's defer (which only removes the inner DownloadedPath under it),
+// so even successful downloads leak the outer shell. The sweep catches those
+// too.
+func SweepOrphanDownloads(tempDir string) {
+	entries, err := os.ReadDir(tempDir)
+	if err != nil {
+		return
+	}
+
+	keep := map[string]bool{}
+	storage.GlobalState.RLock()
+	for _, job := range storage.GlobalState.Jobs {
+		if job == nil || job.DownloadedPath == "" {
+			continue
+		}
+		// DownloadedPath is TempDir/dl-{jobName}/{torrent-name}; keep the
+		// parent directory so the resume logic can stat it.
+		keep[filepath.Base(filepath.Dir(job.DownloadedPath))] = true
+	}
+	storage.GlobalState.RUnlock()
+
+	var removed int
+	var freedBytes uint64
+	for _, e := range entries {
+		name := e.Name()
+		if !strings.HasPrefix(name, "dl-") {
+			continue
+		}
+		if keep[name] {
+			continue
+		}
+		full := filepath.Join(tempDir, name)
+		if e.IsDir() {
+			freedBytes += diskUsage(full)
+		} else if info, err := e.Info(); err == nil {
+			freedBytes += uint64(info.Size())
+		}
+		if err := os.RemoveAll(full); err != nil {
+			log.Printf("Sweep: failed to remove %s: %v", full, err)
+			continue
+		}
+		removed++
+	}
+	if removed > 0 {
+		log.Printf("Sweep: removed %d orphan dl-* entries (%.1f GB freed)",
+			removed, float64(freedBytes)/1e9)
+	}
 }
