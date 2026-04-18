@@ -7,6 +7,7 @@ Designed to run on a VPS behind a VPN with zero manual intervention.
 ## Features
 
 - Torrent downloading via magnet links (anacrolix/torrent, pure Go)
+- Private tracker support with `secrets.yml` passkey store and DHT avoidance
 - Usenet uploading with parallel NNTP connections and yEnc encoding
 - PAR2 recovery block generation (parpar or par2cmdline)
 - Optional 7z encryption with header obfuscation
@@ -18,17 +19,33 @@ Designed to run on a VPS behind a VPN with zero manual intervention.
 - Slow/dead download detection and automatic rejection
 - Live status reporting to companion site (speed, phase, VPN IP)
 - Web-configurable settings (no restart needed for most changes)
+- Versioned agent↔site protocol with upgrade gating and maintenance-mode backoff
+- Failed-completion backfill: on-disk NZB snapshots auto-resubmitted on restart
 
 ## Quick Start
 
 ### 1. Prerequisites
 
-- Docker + Docker Compose
+- Docker + Docker Compose v2
 - A running indexer site instance with an agent token
 - Usenet provider credentials
 - VPN credentials (recommended)
 
-### 2. Configure
+### 2. Install
+
+Use the packaged release (simplest):
+
+```bash
+# Linux/macOS
+./release/install.sh
+
+# Windows
+release\install.bat
+```
+
+The installer checks Docker, creates the data dirs, copies `.env.example` → `.env`, and prompts you to edit before bringing the stack up.
+
+Or configure manually:
 
 ```bash
 cp .env.example .env
@@ -97,7 +114,7 @@ Gluetun exposes a SOCKS5 proxy on port 1080. The torrent client is automatically
 Poll site for task
   |
   v
-Download torrent (VPN-protected)
+Download torrent (VPN-protected; fetches .torrent over HTTPS for private releases)
   |
   v
 Analyze: ffprobe metadata + screenshots
@@ -112,7 +129,7 @@ Optional: 7z encryption
 Upload to Usenet via NNTP
   |
   v
-Report NZB + metadata to site
+Report NZB + metadata to site (gzipped multipart; auto-retry on site maintenance)
   |
   v
 Poll for next task
@@ -160,6 +177,16 @@ Most settings can be changed from the site UI without restarting:
 ## Local UI
 
 The agent also serves a small loopback-only page for editing secrets and on-disk config without the site. Enable by setting `LOCAL_UI_PORT`; bind beyond `127.0.0.1` with `LOCAL_UI_BIND` (not recommended). Auth token is stored in `secrets.yml` alongside any private-tracker passkeys — neither ever leaves the agent.
+
+## Private Trackers
+
+When the site marks a request as private, the agent:
+
+1. Fetches the `.torrent` file from the site over HTTPS (no magnet lookup).
+2. Skips DHT and PEX so the info hash never leaks off the private tracker.
+3. Injects the matching tracker URL with its passkey from `secrets.yml`.
+
+Passkeys are edited via the local UI only. The site never sees them.
 
 ## Processing Options
 
@@ -231,6 +258,301 @@ docker compose up -d
 - Set mode to "auto" on the dashboard
 - Check pool filter isn't excluding available requests
 - Verify there are unfulfilled requests on the site
+
+**"Agent upgrade required" / HTTP 426**
+- Your site requires a newer agent protocol version. Pull the latest release and rebuild.
+
+**Completion uploads backed up on disk**
+- Look for `backup-request-*.nzb` in the data directory. These are NZBs the agent couldn't report because the site was unreachable at the time. They're re-submitted automatically on the next startup (via `/api/agent/backfill`) and deleted on success.
+
+---
+
+## Server API
+
+The agent talks to its companion site over a small JSON/HTTPS protocol. This section is the full contract so you can write your own server. The reference implementation is [client/client.go](client/client.go).
+
+### Conventions
+
+- **Base URL**: `SITE_URL` from the agent's `.env`. All paths below are relative to this.
+- **Auth**: `Authorization: Bearer <AGENT_TOKEN>` on every request. Tokens are opaque strings issued per-agent by your server.
+- **Version headers** (sent on every request):
+  - `X-Agent-Protocol: <int>` — current protocol is `2`.
+  - `X-Agent-Version: <string>` — build version (e.g. `1.1.0`). Informational.
+- **Content**: JSON unless noted. Large payloads (`/complete`, `/backfill`, `/screenshot`) are **gzipped multipart** (`Content-Encoding: gzip`, `Content-Type: multipart/form-data; boundary=...`).
+- **Timeouts**: agent uses a 120s HTTP timeout per request.
+
+### Global status codes
+
+These apply to most endpoints and the agent reacts to them specifically:
+
+| Code | Meaning | Agent behaviour |
+|------|---------|-----------------|
+| `200` | OK | Parse body. |
+| `204` | No content | Treated as "no task" on `/poll`. |
+| `401 Unauthorized` | Bad/expired token | Logs and backs off. |
+| `403 Forbidden` | IP not approved for this token | Surfaces error; user must approve in site UI. |
+| `404 Not Found` | Endpoint not implemented | On optional endpoints (`/local-config`, `/directives`) the agent treats as empty. |
+| `426 Upgrade Required` | Agent protocol below site minimum | Pauses polling ~10 min. Body: `{"min_protocol": N, "message": "..."}`. |
+| `503 Service Unavailable` | Site in maintenance (if body JSON has `maintenance:true`) | Agent waits `eta_seconds` + 15s and retries. |
+
+### Maintenance response
+
+Returned with `503` when the site wants agents to back off:
+
+```json
+{
+  "maintenance": true,
+  "reason": "VACUUM FULL in progress",
+  "started_at": 1713312000,
+  "elapsed_seconds": 45,
+  "eta_seconds": 180
+}
+```
+
+---
+
+### 1. Lifecycle — startup
+
+#### `POST /api/agent/clear-locks`
+
+Called once at agent startup to release any locks this agent still holds from a previous crash.
+
+- **Request body**: *(empty)*
+- **Response**: `{"cleared": <int>}` — count of locks expired.
+
+#### `POST /api/agent/backfill`
+
+Resubmit an NZB from a local backup (used when a previous `/complete` failed). The site should dedupe by NZB hash and fulfil the referenced request as if `/complete` had succeeded.
+
+- **Content-Encoding**: `gzip`
+- **Form fields**:
+  | Field | Type | Required | Notes |
+  |-------|------|----------|-------|
+  | `request_id` | string (int64) | yes | Original request this NZB satisfies. |
+  | `password` | string | no | If the release was encrypted. |
+  | `nzb_data` | file | yes | The `.nzb` file bytes. |
+- **Response**: `{"nzb_id": <int64>}`
+- **Idempotency**: must be safe to retry. The agent only deletes its local backup after a `200`.
+
+---
+
+### 2. Lifecycle — polling loop
+
+The agent runs this loop every `PollInterval` seconds (default 30s).
+
+#### `GET /api/agent/config`
+
+Server-side tunables. Returned values with `0`/empty mean "use local default".
+
+- **Response**:
+  ```json
+  {
+    "max_concurrent": 3,
+    "cpu_max_percent": 85,
+    "max_disk_usage_gb": 0,
+    "slow_speed_threshold": 0.05,
+    "slow_speed_timeout": 10,
+    "low_peers_threshold": 0,
+    "low_peers_timeout": 0,
+    "web_overrides": { "torrent_port": "51413" }
+  }
+  ```
+  `web_overrides` is the authoritative web-tier map for the agent's layered config. Keys absent here fall through to env/yml.
+
+#### `POST /api/agent/local-config`
+
+Snapshot of the agent's on-disk + env config so the site UI can show provenance badges. Returning `404` here is allowed — the agent treats it as "site doesn't support this yet".
+
+- **Request body**:
+  ```json
+  {
+    "on_disk_writable": true,
+    "has_private_trackers": false,
+    "local_ui_url": "http://127.0.0.1:7878",
+    "yml_path": "/app/data/config.yml",
+    "local": {
+      "torrent_port": { "value": "51413", "source": "yml" },
+      "cpu_max_percent": { "value": "85", "source": "env" }
+    }
+  }
+  ```
+- **Response**: ignored.
+
+#### `GET /api/agent/directives`
+
+Queued instructions for this agent. The agent acks each one after processing it.
+
+- **Response**:
+  ```json
+  {
+    "directives": [
+      { "id": 101, "kind": "write_config", "payload": { "updates": { "torrent_port": "51413" } } }
+    ]
+  }
+  ```
+  Current kinds:
+  - `write_config` — payload `{"updates": {"<key>": "<value>"}}`. Agent writes to `config.yml`.
+
+#### `POST /api/agent/directives/ack`
+
+- **Request body**: `{"id": <int64>, "error": ""}` — `error` is empty on success, message on failure.
+- **Response**: ignored.
+
+#### `POST /api/agent/poll`
+
+Request work. Return **one** of three shapes:
+
+Task assigned:
+```json
+{
+  "request_id": 987654321,
+  "lock_id": 42,
+  "title": "Some Release Title",
+  "nyaa_url": "https://nyaa.si/view/1234",
+  "info_hash": "deadbeefcafebabe...",
+  "category": "anime",
+  "season": "2024-Winter",
+  "episodes": "1-13",
+  "boost_count": 0,
+  "private": false,
+  "torrent_file_url": "/api/agent/torrent/42"
+}
+```
+No work available:
+```json
+{ "reason": "no available requests" }
+```
+Command to the agent:
+```json
+{ "command": "stop" }
+```
+
+Field notes:
+- `lock_id` identifies this agent's hold on the request and is echoed in `/progress`, `/status`, and `/complete`.
+- `private: true` **requires** `torrent_file_url` to be set — the agent will fetch the file instead of resolving via DHT/magnet. Only available to v2+ agents.
+- Return `204 No Content` for legacy "no task" (still honoured).
+
+#### `POST /api/agent/log`
+
+Fire-and-forget log line for dashboard display.
+
+- **Request body**: `{"level": "info|warn|error", "message": "..."}`
+- **Response**: ignored.
+
+---
+
+### 3. Lifecycle — during a task
+
+#### `GET <torrent_file_url>` (typically `/api/agent/torrent/{lock_id}`)
+
+Returns the raw `.torrent` file bytes for private tasks. The URL is whatever path you returned in `AgentTask.torrent_file_url`.
+
+- **Response**: `application/x-bittorrent` body, ≤ 10 MB.
+- **404**: lock expired or not private — agent aborts the task.
+
+#### `POST /api/agent/progress`
+
+Short, human-readable progress string. Throttled to ~10s by the agent.
+
+- **Request body**: `{"lock_id": 42, "progress": "Downloading: 45% @ 12.34 MB/s", "speed": "12.34 MB/s"}`
+- **Response**: ignored.
+
+#### `POST /api/agent/status`
+
+Full live telemetry, posted every 5s from a background goroutine while a task runs. Response can ask the agent to cancel.
+
+- **Request body**:
+  ```json
+  {
+    "phase": "downloading",
+    "vpn_status": "up",
+    "public_ip": "203.0.113.42",
+    "download_speed": "45.23 MB/s",
+    "upload_speed": "12.34 MB/s",
+    "task_title": "Some Release Title",
+    "request_id": 987654321,
+    "disk_free_gb": 412.7,
+    "disk_reserved_gb": 8.5,
+    "files": [
+      {
+        "name": "episode01.mkv",
+        "size": 1073741824,
+        "transferred": 536870912,
+        "percent": 50.0,
+        "speed": "12.34 MB/s",
+        "up_speed": "5.67 MB/s",
+        "phase": "downloading",
+        "peers": 7
+      }
+    ]
+  }
+  ```
+  `phase` values the agent emits: `idle`, `downloading`, `uploading`, `seeding`, `processing`.
+
+- **Response**:
+  ```json
+  { "ok": true, "cancel_request_id": 0 }
+  ```
+  If `cancel_request_id` matches the current `request_id`, the agent aborts the task cleanly.
+
+---
+
+### 4. Lifecycle — task completion
+
+#### `POST /api/agent/complete`
+
+Final report for a task. The agent sends it gzipped multipart and retries up to 3 times with 10s backoff (infinitely on maintenance).
+
+- **Content-Encoding**: `gzip`
+- **Form fields**:
+  | Field | Type | Required | Notes |
+  |-------|------|----------|-------|
+  | `lock_id` | string (int) | yes | |
+  | `request_id` | string (int64) | yes | |
+  | `status` | string | yes | `completed`, `failed`, or `aborted`. |
+  | `fail_reason` | string | when `status != completed` | Human-readable. |
+  | `password` | string | no | Present if `ENCRYPT=true`. |
+  | `nzb_data` | file | yes on success | The `.nzb` file. |
+  | `media_info` | string (JSON) | yes on success | Serialized `VideoInfo` (codec, resolution, HDR, audio tracks, etc). |
+  | `screenshot_N` | file | no | `screenshot_1`, `screenshot_2`, … JPEGs. |
+- **Response**: `{"ok": true, "nzb_id": 1234567}`
+- **Size cap**: payload (base + screenshots) is capped at ~80 MB. If larger, the agent sends `/complete` without screenshots and then uploads each screenshot separately via `/api/agent/screenshot`.
+- **Status semantics**:
+  - `completed` — release stored, request fulfilled.
+  - `failed` — unrecoverable error in the release itself (fail the request).
+  - `aborted` — agent-local condition (disk, VPN, cancel); just release the lock, don't blame the request.
+
+#### `POST /api/agent/screenshot`
+
+Oversized screenshots uploaded individually after a successful `/complete`.
+
+- **Content-Encoding**: `gzip`
+- **Form fields**:
+  | Field | Type | Required |
+  |-------|------|----------|
+  | `nzb_id` | string (int64) | yes |
+  | `screenshot` | file | yes |
+- **Response**: ignored (non-fatal if it fails — a warning is logged).
+
+---
+
+### Minimal implementation checklist
+
+To host an agent compatibly, a server must implement at least:
+
+- Auth: issue bearer tokens bound to an agent identity.
+- `POST /api/agent/poll` — hand out work with a `lock_id`.
+- `POST /api/agent/complete` — accept the NZB and fulfil the request.
+- `POST /api/agent/clear-locks` — expire locks on reconnect.
+- `GET /api/agent/config` — return at least `{}`.
+- `POST /api/agent/status` — at minimum return `{"ok": true}`.
+- `POST /api/agent/log`, `POST /api/agent/progress` — can be no-ops returning `200`.
+
+The rest (`/local-config`, `/directives`, `/directives/ack`, `/backfill`, `/screenshot`, `/torrent/...`) can be added incrementally; the agent tolerates `404` on the optional ones.
+
+Advertise a minimum agent protocol by returning `426 Upgrade Required` with `{"min_protocol":N,"message":"..."}` whenever an older agent calls in.
+
+---
 
 ## Built With
 
