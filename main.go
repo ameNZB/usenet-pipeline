@@ -72,16 +72,59 @@ func recordAbort(reason string) {
 
 // oversizeSkip tracks request IDs that failed the pre-flight disk check, so
 // we can decline to re-download their metadata if the site hands the same
-// task back immediately. In-memory only — resets on restart, which is fine
-// because the sweep also runs then.
+// task back immediately. Persisted to oversizeSkipFile so a restart doesn't
+// reset the cooldown — without that, an agent restart turns the
+// "30-min skip" into "1 expensive metadata fetch and re-abort."
 var (
-	oversizeSkipMu sync.Mutex
-	oversizeSkip   = map[int64]time.Time{}
+	oversizeSkipMu   sync.Mutex
+	oversizeSkip     = map[int64]time.Time{}
+	oversizeSkipFile string
 )
+
+// loadOversizeSkip reads the persisted skip set on startup. Anything
+// already expired is dropped on load. Best-effort: any read/parse error
+// just leaves the in-memory map empty.
+func loadOversizeSkip(path string) {
+	oversizeSkipFile = path
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return
+	}
+	var raw map[int64]time.Time
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return
+	}
+	now := time.Now()
+	oversizeSkipMu.Lock()
+	for id, exp := range raw {
+		if exp.After(now) {
+			oversizeSkip[id] = exp
+		}
+	}
+	oversizeSkipMu.Unlock()
+}
+
+// saveOversizeSkip writes the current map. Caller must hold oversizeSkipMu.
+// Best-effort: a write failure is logged but doesn't fail the operation
+// that triggered the save (the in-memory map is still authoritative for
+// the rest of this process's lifetime).
+func saveOversizeSkipLocked() {
+	if oversizeSkipFile == "" {
+		return
+	}
+	data, err := json.Marshal(oversizeSkip)
+	if err != nil {
+		return
+	}
+	if err := os.WriteFile(oversizeSkipFile, data, 0644); err != nil {
+		log.Printf("oversizeSkip: persist failed: %v", err)
+	}
+}
 
 func markOversize(requestID int64) {
 	oversizeSkipMu.Lock()
 	oversizeSkip[requestID] = time.Now().Add(oversizeSkipTTL)
+	saveOversizeSkipLocked()
 	oversizeSkipMu.Unlock()
 }
 
@@ -94,6 +137,7 @@ func shouldSkipOversize(requestID int64) bool {
 	}
 	if time.Now().After(exp) {
 		delete(oversizeSkip, requestID)
+		saveOversizeSkipLocked()
 		return false
 	}
 	return true
@@ -115,9 +159,14 @@ func abortPauseRemaining() time.Duration {
 }
 
 // isAgentLocalError returns true for errors that are about the agent's own
-// environment (port conflict, disk space, proxy reachability) rather than
-// anything wrong with the torrent. These should release the lock without
-// marking the request as failed for this agent.
+// environment (port conflict, proxy reachability) rather than anything
+// wrong with the torrent. These should release the lock without marking
+// the request as failed for this agent.
+//
+// Disk-full is intentionally NOT in this list: it overlaps with
+// isRuntimeDiskFullError and we want callers to check the disk-full path
+// first so a single oversized torrent gets the per-request oversize
+// cooldown instead of bumping the consecutive-abort counter.
 func isAgentLocalError(err error) bool {
 	if err == nil {
 		return false
@@ -125,10 +174,24 @@ func isAgentLocalError(err error) bool {
 	s := err.Error()
 	return strings.Contains(s, "address already in use") ||
 		strings.Contains(s, "Only one usage of each socket") ||
-		strings.Contains(s, "no space left") ||
-		strings.Contains(s, "insufficient disk space") ||
 		strings.Contains(s, "SOCKS5") ||
 		strings.Contains(s, "failed to create SOCKS5")
+}
+
+// isRuntimeDiskFullError catches "disk filled mid-download" errors that
+// don't carry our ErrInsufficientDisk sentinel — typically OS-level write
+// failures from anacrolix/torrent or the rar/par2 staging steps. These
+// share a fix with the pre-flight oversize case (back off this specific
+// request, don't pause the whole agent), so we route them through the
+// same oversize-cooldown path.
+func isRuntimeDiskFullError(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := err.Error()
+	return strings.Contains(s, "no space left") ||
+		strings.Contains(s, "insufficient disk space") ||
+		strings.Contains(s, "There is not enough space on the disk")
 }
 
 func setLivePhase(phase string) {
@@ -386,6 +449,11 @@ func main() {
 
 	storage.StateFile = filepath.Join(cfg.TempDir, "state.json")
 	storage.LoadState()
+
+	// Restore the per-request oversize cooldown set so a restart doesn't
+	// turn the cooldown into a single expensive metadata fetch. Sibling of
+	// state.json so the operator only has to know about TempDir.
+	loadOversizeSkip(filepath.Join(cfg.TempDir, "oversize-skip.json"))
 
 	// Remove any dl-* directories left behind by crashed/aborted tasks.
 	// Must run after LoadState so the resumable set is known, and before
@@ -758,7 +826,7 @@ func processTask(cfg *config.Config, site *client.SiteClient, task *client.Agent
 		// one will. Abort the task back to the pool but skip the
 		// self-pause counter, and remember the request ID briefly so we
 		// don't re-fetch its metadata if the site hands it right back.
-		if errors.Is(err, services.ErrInsufficientDisk) {
+		if errors.Is(err, services.ErrInsufficientDisk) || isRuntimeDiskFullError(err) {
 			reportProgress("Aborted", reason)
 			_ = site.Complete(client.CompleteResult{
 				LockID:     task.LockID,
@@ -769,9 +837,9 @@ func processTask(cfg *config.Config, site *client.SiteClient, task *client.Agent
 			markOversize(task.RequestID)
 			return
 		}
-		// Agent-local errors (port bind, disk full, proxy down) aren't the
-		// torrent's fault — release the lock without burning a cooldown,
-		// and increment the self-pause counter so repeated failures
+		// Agent-local errors (port bind, proxy down) aren't the torrent's
+		// fault — release the lock without burning a cooldown, and
+		// increment the self-pause counter so repeated failures
 		// eventually back off instead of churning the whole queue.
 		if isAgentLocalError(err) {
 			reportProgress("Aborted", reason)
