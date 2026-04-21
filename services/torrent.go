@@ -529,12 +529,15 @@ func downloadAndWaitSeed(ctx context.Context, cl *torrent.Client, t *torrent.Tor
 					t.Drop()
 					return filepath.Join(dataDir, t.Name()), ErrSlowDownload
 				}
-				if so.StallMins > 0 && percent < 99 {
+				// No percent gate: a torrent stuck at 99.x% with 0 peers
+				// never finishes — the earlier `percent < 99` cap let those
+				// hold a slot forever. StallMins itself is the knob.
+				if so.StallMins > 0 {
 					if speed == 0 {
 						if stallSince.IsZero() {
 							stallSince = time.Now()
 						} else if time.Since(stallSince) > time.Duration(so.StallMins)*time.Minute {
-							log.Printf("[%s] Rejecting stalled download: 0 speed for %v", jobName, time.Since(stallSince).Round(time.Second))
+							log.Printf("[%s] Rejecting stalled download: 0 speed for %v at %.1f%%", jobName, time.Since(stallSince).Round(time.Second), percent)
 							t.Drop()
 							return filepath.Join(dataDir, t.Name()), ErrSlowDownload
 						}

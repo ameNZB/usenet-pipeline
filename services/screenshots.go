@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 )
 
@@ -16,12 +17,21 @@ import (
 const screenshotWorkers = 3
 
 // GenerateScreenshots creates lossless PNG screenshots at evenly spaced
-// intervals through the video. We emit PNG (rather than JPEG) so the server
+// intervals through the video. Thin wrapper over
+// GenerateScreenshotsWatermarked with no watermark — keeps the existing
+// online-path call sites untouched while the offline path opts in to
+// watermark support via the newer signature.
+func GenerateScreenshots(ctx context.Context, videoPath, outputDir string, duration float64, count int) ([]string, error) {
+	return GenerateScreenshotsWatermarked(ctx, videoPath, outputDir, duration, count, "")
+}
+
+// GenerateScreenshotsWatermarked is the implementation. If watermark is
+// non-empty, the text is burned into the bottom-right of every frame via
+// ffmpeg's drawtext filter. We emit PNG (rather than JPEG) so the server
 // can re-encode to lossless WebP without ever going through a lossy stage —
 // users use these to judge release quality, and any JPEG step in the middle
-// would defeat that. Returns the file paths of generated screenshots.
-// count is the number of screenshots (default 6).
-func GenerateScreenshots(ctx context.Context, videoPath, outputDir string, duration float64, count int) ([]string, error) {
+// would defeat that.
+func GenerateScreenshotsWatermarked(ctx context.Context, videoPath, outputDir string, duration float64, count int, watermark string) ([]string, error) {
 	if count <= 0 {
 		count = 6
 	}
@@ -74,14 +84,24 @@ func GenerateScreenshots(ctx context.Context, videoPath, outputDir string, durat
 			timestamp := formatTimestamp(t)
 			outPath := filepath.Join(outputDir, fmt.Sprintf("screen_%02d.png", idx+1))
 
-			cmd := exec.CommandContext(ctx, "ffmpeg",
+			args := []string{
 				"-ss", timestamp,
 				"-i", videoPath,
 				"-vframes", "1",
-				"-c:v", "png",
-				"-y",
-				outPath,
-			)
+			}
+			// Burn the watermark into the frame via drawtext. Positioned
+			// 10px from the bottom-right corner with a translucent black
+			// box so it stays legible on both bright and dark scenes.
+			// Chars that are special in ffmpeg filter syntax (: \ ')
+			// are escaped so operators can paste odd group names without
+			// breaking the pipeline.
+			if watermark != "" {
+				escaped := escapeDrawtext(watermark)
+				filter := fmt.Sprintf("drawtext=text='%s':fontcolor=white:fontsize=24:box=1:boxcolor=black@0.5:boxborderw=6:x=w-tw-12:y=h-th-12", escaped)
+				args = append(args, "-vf", filter)
+			}
+			args = append(args, "-c:v", "png", "-y", outPath)
+			cmd := exec.CommandContext(ctx, "ffmpeg", args...)
 			cmd.Stdout = nil
 			cmd.Stderr = nil
 
@@ -109,6 +129,20 @@ func GenerateScreenshots(ctx context.Context, videoPath, outputDir string, durat
 		paths = append(paths, r.path)
 	}
 	return paths, nil
+}
+
+// escapeDrawtext escapes the characters that are special inside an ffmpeg
+// drawtext text= value: backslash is the escape char, colon separates
+// filter options, and single-quote closes the filter argument we built
+// around the text. No general-purpose shell escape needed — the filter
+// string is passed as a single argv argument, not run through a shell.
+func escapeDrawtext(s string) string {
+	r := strings.NewReplacer(
+		`\`, `\\`,
+		`:`, `\:`,
+		`'`, `\'`,
+	)
+	return r.Replace(s)
 }
 
 // formatTimestamp converts seconds to HH:MM:SS.mmm format for ffmpeg.

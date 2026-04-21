@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/ameNZB/usenet-pipeline/config"
+	"github.com/ameNZB/usenet-pipeline/storage"
 )
 
 // LocalUI serves a small HTML + JSON interface on loopback for users who
@@ -31,11 +32,12 @@ import (
 type LocalUI struct {
 	cfg      *config.Config
 	secrets  *SecretsStore
+	db       *storage.DB
 	port     int
 	bindAddr string
 }
 
-func StartLocalUI(cfg *config.Config, secrets *SecretsStore) *LocalUI {
+func StartLocalUI(cfg *config.Config, secrets *SecretsStore, db *storage.DB) *LocalUI {
 	port, _ := strconv.Atoi(os.Getenv("LOCAL_UI_PORT"))
 	if port <= 0 {
 		return nil
@@ -44,7 +46,7 @@ func StartLocalUI(cfg *config.Config, secrets *SecretsStore) *LocalUI {
 	if bind == "" {
 		bind = "127.0.0.1"
 	}
-	ui := &LocalUI{cfg: cfg, secrets: secrets, port: port, bindAddr: bind}
+	ui := &LocalUI{cfg: cfg, secrets: secrets, db: db, port: port, bindAddr: bind}
 	addr := net.JoinHostPort(bind, strconv.Itoa(port))
 
 	mux := http.NewServeMux()
@@ -52,6 +54,18 @@ func StartLocalUI(cfg *config.Config, secrets *SecretsStore) *LocalUI {
 	mux.HandleFunc("/config", ui.handleConfig)
 	mux.HandleFunc("/secrets", ui.handleSecrets)
 	mux.HandleFunc("/status", ui.handleStatus)
+	mux.HandleFunc("/groups", ui.handleGroups)
+	mux.HandleFunc("/groups/create", ui.handleGroupCreate)
+	mux.HandleFunc("/groups/update", ui.handleGroupUpdate)
+	mux.HandleFunc("/groups/delete", ui.handleGroupDelete)
+	mux.HandleFunc("/watches", ui.handleWatches)
+	mux.HandleFunc("/watches/create", ui.handleWatchCreate)
+	mux.HandleFunc("/watches/update", ui.handleWatchUpdate)
+	mux.HandleFunc("/watches/delete", ui.handleWatchDelete)
+	mux.HandleFunc("/jobs", ui.handleJobs)
+	mux.HandleFunc("/jobs/retry", ui.handleJobRetry)
+	mux.HandleFunc("/jobs/delete", ui.handleJobDelete)
+	mux.HandleFunc("/events", ui.handleEvents)
 
 	srv := &http.Server{
 		Addr:         addr,
@@ -160,25 +174,264 @@ func (u *LocalUI) handleSecrets(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
 }
 
-var localUITmpl = template.Must(template.New("localui").Parse(`<!doctype html>
-<html><head>
-<meta charset="utf-8"><title>Agent Local UI</title>
-<style>
-body { font-family: system-ui, sans-serif; max-width: 900px; margin: 2em auto; padding: 0 1em; background: #111; color: #eee; }
-h1, h2 { font-weight: 500; }
-table { width: 100%; border-collapse: collapse; font-size: 0.9em; }
-th, td { padding: 6px 8px; border-bottom: 1px solid #333; text-align: left; }
-input, button { background: #222; color: #eee; border: 1px solid #444; padding: 4px 8px; border-radius: 3px; }
-button { cursor: pointer; }
-button.primary { background: #336; border-color: #557; }
-.badge { display: inline-block; padding: 1px 6px; font-size: 0.7em; border-radius: 3px; background: #333; }
-.badge.env { background: #553; } .badge.yml { background: #255; } .badge.default { background: #333; }
-.warn { color: #fb3; font-size: 0.8em; }
-</style>
-</head><body>
-<h1>Agent Local UI</h1>
-<p class="warn">Running on {{.BindAddr}}. Anything edited here is persisted on this machine and never leaves it.
-{{if not .Writable}}<br><strong>config.yml is read-only</strong> — check the file permission / Docker bind-mount.{{end}}</p>
+// ── Template FuncMaps ─────────────────────────────────────────────────────
+
+// groupsTmplFuncs: small helpers the groups form relies on. Registered
+// before Parse so the template compiler treats them as function calls
+// instead of field lookups (which would fail at render time).
+var groupsTmplFuncs = template.FuncMap{
+	// derefBool reads through a *bool, returning false for nil so template
+	// comparisons like `{{if derefBool .Obfuscate}}` don't panic on the
+	// "inherit global" case.
+	"derefBool": func(b *bool) bool {
+		if b == nil {
+			return false
+		}
+		return *b
+	},
+}
+
+// jobsTmplFuncs: helpers for the /jobs page.
+var jobsTmplFuncs = template.FuncMap{
+	"formatTime": func(t *time.Time) string {
+		if t == nil || t.IsZero() {
+			return "—"
+		}
+		return t.Local().Format("Jan 02 15:04:05")
+	},
+	// statusClass maps a job status to a CSS class so the status badge
+	// can be coloured without the template having to branch five times.
+	"statusClass": func(s string) string {
+		switch s {
+		case "completed":
+			return "ok"
+		case "failed":
+			return "err"
+		case "processing":
+			return "yml"
+		case "cancelled":
+			return "default"
+		default: // queued
+			return "env"
+		}
+	},
+}
+
+// watchesTmplFuncs: helpers for comparing nullable group FKs in the
+// watches template.
+var watchesTmplFuncs = template.FuncMap{
+	// isGroup reports whether a nullable group pointer matches a given id.
+	// Lets the <select> option loop mark the currently-assigned group
+	// without template gymnastics over *int64.
+	"isGroup": func(sel *int64, id int64) bool {
+		return sel != nil && *sel == id
+	},
+}
+
+// ── Page templates ────────────────────────────────────────────────────────
+//
+// Each page overrides two blocks defined by the layout: "title" (shown in
+// <title> + top bar <h1>) and "content" (main column). The shared sidebar,
+// status panel, and Flash/Err rendering come from the layout — page
+// templates focus only on what's actually different between pages.
+
+var groupsTmpl = buildPageTemplate("groups", `
+{{define "title"}}Groups{{end}}
+{{define "content"}}
+<p class="lead">
+Groups define where offline uploads post (newsgroups) and let you override
+the global PAR2/screenshot/obfuscation defaults per category. Leave a
+field blank to inherit the global default.
+</p>
+
+<h2>Existing</h2>
+{{if .Groups}}
+<table>
+<tr>
+  <th>Name</th><th>Type</th><th>Newsgroups</th>
+  <th>Samples</th><th>Sec/sample</th>
+  <th>Banned ext.</th>
+  <th>PAR2%</th><th>Obf.</th><th>Watermark</th>
+  <th>Source</th><th>v</th><th></th>
+</tr>
+{{range .Groups}}
+<tr>
+<form class="row-form" method="post" action="/groups/update">
+  <input type="hidden" name="id" value="{{.ID}}">
+  <td><input name="name" value="{{.Name}}" size="12" required{{if eq .Source "site"}} readonly{{end}}></td>
+  <td><input name="type" value="{{.Type}}" size="7" placeholder="video" list="type-list"{{if eq .Source "site"}} readonly{{end}}></td>
+  <td><textarea name="newsgroups" rows="2" required{{if eq .Source "site"}} readonly{{end}}>{{range .Newsgroups}}{{.}}
+{{end}}</textarea></td>
+  <td><input name="screenshots" value="{{if .Screenshots}}{{.Screenshots}}{{end}}" size="3" type="number" min="0"{{if eq .Source "site"}} readonly{{end}}></td>
+  <td><input name="sample_seconds" value="{{if .SampleSeconds}}{{.SampleSeconds}}{{end}}" size="3" type="number" min="1"{{if eq .Source "site"}} readonly{{end}}></td>
+  <td><textarea name="banned_extensions" rows="2" cols="12" placeholder="(default list)"{{if eq .Source "site"}} readonly{{end}}>{{range .BannedExtensions}}{{.}}
+{{end}}</textarea></td>
+  <td><input name="par2_redundancy" value="{{if .Par2Redundancy}}{{.Par2Redundancy}}{{end}}" size="3" type="number" min="0" max="100"{{if eq .Source "site"}} readonly{{end}}></td>
+  <td>
+    <select name="obfuscate"{{if eq .Source "site"}} disabled{{end}}>
+      <option value=""{{if not .Obfuscate}} selected{{end}}>inherit</option>
+      {{if .Obfuscate}}
+        {{if derefBool .Obfuscate}}<option value="1" selected>yes</option><option value="0">no</option>
+        {{else}}<option value="1">yes</option><option value="0" selected>no</option>{{end}}
+      {{else}}<option value="1">yes</option><option value="0">no</option>{{end}}
+    </select>
+  </td>
+  <td><input name="watermark_text" value="{{.WatermarkText}}" size="10" placeholder="-YourTag"{{if eq .Source "site"}} readonly{{end}}></td>
+  <td><span class="badge {{.Source}}">{{.Source}}</span></td>
+  <td class="small">{{.Version}}</td>
+  <td>
+    {{if ne .Source "site"}}<button type="submit" class="primary">Save</button>{{end}}
+</form>
+{{if ne .Source "site"}}
+<form class="row-form" method="post" action="/groups/delete" style="display:inline;" onsubmit="return confirm('Delete {{.Name}}?')">
+  <input type="hidden" name="id" value="{{.ID}}">
+  <button type="submit" class="danger">Delete</button>
+</form>
+{{end}}
+  </td>
+</tr>
+{{end}}
+</table>
+<datalist id="type-list">
+  <option value="video"><option value="manga"><option value="music">
+</datalist>
+{{else}}
+<p class="small">No groups defined yet.</p>
+{{end}}
+
+<h2 style="margin-top:28px;">Create new</h2>
+<form method="post" action="/groups/create">
+<table>
+<tr><th>Name</th><td><input name="name" placeholder="anime" required></td></tr>
+<tr><th>Type</th><td><input name="type" placeholder="video" list="type-list-new"><datalist id="type-list-new"><option value="video"><option value="manga"><option value="music"></datalist> <span class="small">video / manga / music — or any other label for a custom sampling behaviour</span></td></tr>
+<tr><th>Newsgroups</th><td><textarea name="newsgroups" rows="3" placeholder="alt.binaries.multimedia.anime.highspeed&#10;alt.binaries.boneless" required></textarea><div class="small">One per line (commas also work).</div></td></tr>
+<tr><th>Samples</th><td><input name="screenshots" size="3" type="number" min="0"> <span class="small">count — for video: screenshots; manga: pages; music: audio clips. Blank = inherit default (6).</span></td></tr>
+<tr><th>Sec/sample</th><td><input name="sample_seconds" size="3" type="number" min="1"> <span class="small">audio-only: duration of each clip. Blank = inherit default (5).</span></td></tr>
+<tr><th>Banned extensions</th><td><textarea name="banned_extensions" rows="2" placeholder="(leave blank to inherit the default blocklist)"></textarea><div class="small">One per line. Blank = use the hardcoded default; non-empty list replaces the default outright.</div></td></tr>
+<tr><th>PAR2 %</th><td><input name="par2_redundancy" size="3" type="number" min="0" max="100"> <span class="small">blank = inherit global default</span></td></tr>
+<tr><th>Obfuscate</th><td><select name="obfuscate"><option value="">inherit</option><option value="1">yes</option><option value="0">no</option></select></td></tr>
+<tr><th>Watermark</th><td><input name="watermark_text" placeholder="-YourTag"> <span class="small">drawn on every screenshot; blank = off</span></td></tr>
+</table>
+<p><button type="submit" class="primary">Create group</button></p>
+</form>
+{{end}}
+`, groupsTmplFuncs)
+
+var watchesTmpl = buildPageTemplate("watches", `
+{{define "title"}}Watch Folders{{end}}
+{{define "content"}}
+<p class="lead">
+Folders the offline pipeline scans for new files. Each folder is tagged
+with a group, which decides where the resulting NZB gets posted. Paths
+must be absolute.
+</p>
+
+<h2>Existing</h2>
+{{if .Watches}}
+<table>
+<tr><th>Path</th><th>Group</th><th>Enabled</th><th></th></tr>
+{{range .Watches}}
+<tr>
+<form class="row-form" method="post" action="/watches/update">
+  <input type="hidden" name="id" value="{{.ID}}">
+  <input type="hidden" name="enabled_present" value="1">
+  <td><input name="path" value="{{.Path}}" size="40" required></td>
+  <td>
+    <select name="group_id">
+      <option value=""{{if not .GroupID}} selected{{end}}>— unassigned —</option>
+      {{$selected := .GroupID}}
+      {{range $.Groups}}
+        <option value="{{.ID}}"{{if isGroup $selected .ID}} selected{{end}}>{{.Name}}</option>
+      {{end}}
+    </select>
+  </td>
+  <td><input type="checkbox" name="enabled" value="1"{{if .Enabled}} checked{{end}}></td>
+  <td>
+    <button type="submit" class="primary">Save</button>
+</form>
+<form class="row-form" method="post" action="/watches/delete" style="display:inline;" onsubmit="return confirm('Delete watch {{.Path}}?')">
+  <input type="hidden" name="id" value="{{.ID}}">
+  <button type="submit" class="danger">Delete</button>
+</form>
+  </td>
+</tr>
+{{end}}
+</table>
+{{else}}
+<p class="small">No watch folders configured yet.</p>
+{{end}}
+
+<h2 style="margin-top:28px;">Create new</h2>
+{{if .Groups}}
+<form method="post" action="/watches/create">
+<input type="hidden" name="enabled_present" value="1">
+<table>
+<tr><th>Path</th><td><input name="path" placeholder="/data/watch/anime" size="40" required></td></tr>
+<tr><th>Group</th><td>
+  <select name="group_id" required>
+    <option value="">— pick a group —</option>
+    {{range .Groups}}<option value="{{.ID}}">{{.Name}}</option>{{end}}
+  </select>
+</td></tr>
+<tr><th>Enabled</th><td><input type="checkbox" name="enabled" value="1" checked></td></tr>
+</table>
+<p><button type="submit" class="primary">Add watch</button></p>
+</form>
+{{else}}
+<p style="color:var(--warn);">Create at least one <a href="/groups" style="color:var(--accent);">group</a> first, then come back to wire a folder to it.</p>
+{{end}}
+{{end}}
+`, watchesTmplFuncs)
+
+var jobsTmpl = buildPageTemplate("jobs", `
+{{define "title"}}Offline Jobs{{end}}
+{{define "content"}}
+<p class="lead">
+Every file detected in a watch folder becomes a job. The processor runs
+them end-to-end: stage → PAR2 → optional encrypt → upload → NZB written
+to the output dir. Retry a failed job once the underlying issue is fixed;
+deleting a row lets the watcher re-queue the same source file on next scan.
+</p>
+
+{{if .Jobs}}
+<table>
+<tr><th>Title</th><th>Group</th><th>Status</th><th>Created</th><th>Error</th><th></th></tr>
+{{range .Jobs}}
+<tr>
+  <td>{{.Title}}<div class="small">{{.SourcePath}}</div></td>
+  <td>{{.GroupNameAtCreation}}</td>
+  <td><span class="badge {{statusClass .Status}}">{{.Status}}</span>{{if .Phase}} <span class="small">{{.Phase}}</span>{{end}}</td>
+  <td class="small">{{.CreatedAt.Local.Format "Jan 02 15:04:05"}}</td>
+  <td style="color:var(--err);" class="small">{{.Error}}</td>
+  <td>
+    {{if or (eq .Status "failed") (eq .Status "completed")}}
+    <form class="row-form" method="post" action="/jobs/retry" style="display:inline;">
+      <input type="hidden" name="id" value="{{.ID}}">
+      <button type="submit">Retry</button>
+    </form>
+    {{end}}
+    <form class="row-form" method="post" action="/jobs/delete" style="display:inline;" onsubmit="return confirm('Delete job for {{.Title}}?')">
+      <input type="hidden" name="id" value="{{.ID}}">
+      <button type="submit" class="danger">Delete</button>
+    </form>
+  </td>
+</tr>
+{{end}}
+</table>
+{{else}}
+<p class="small">No jobs yet. Drop a file into a watch folder and give it a moment.</p>
+{{end}}
+{{end}}
+`, jobsTmplFuncs)
+
+var localUITmpl = buildPageTemplate("config", `
+{{define "title"}}Config{{end}}
+{{define "content"}}
+<p class="lead">
+Edit the layered agent config and per-tracker passkeys. Changes here are
+persisted on this machine only; passkeys never leave the host.
+{{if not .Writable}}<br><strong style="color:var(--warn);">config.yml is read-only</strong> — check file permission / Docker bind-mount.{{end}}
+</p>
 
 <h2>Config (config.yml)</h2>
 <form id="cf">
@@ -193,26 +446,24 @@ button.primary { background: #336; border-color: #557; }
 {{end}}
 </table>
 <p><button type="submit" class="primary" {{if not .Writable}}disabled{{end}}>Save to config.yml</button>
-<span id="cs"></span></p>
+<span id="cs" class="small"></span></p>
 </form>
 
-<h2>Private Trackers (secrets.yml, 0600)</h2>
-<p style="font-size:0.8em;color:#999;">
-Passkeys stay on this machine only. The site sees <em>that</em> trackers are configured, not the keys.
-</p>
+<h2 style="margin-top:28px;">Private Trackers (secrets.yml, 0600)</h2>
+<p class="small">Passkeys stay on this machine only. The site sees <em>that</em> trackers are configured, not the keys.</p>
 <table id="sec">
 <tr><th>Host</th><th></th></tr>
 {{range .SecretsHosts}}
-<tr><td>{{.}}</td><td><button type="button" onclick="delHost('{{.}}')">remove</button></td></tr>
+<tr><td>{{.}}</td><td><button type="button" onclick="delHost('{{.}}')" class="danger">remove</button></td></tr>
 {{else}}
-<tr><td colspan="2" style="color:#999;">No trackers configured.</td></tr>
+<tr><td colspan="2" class="small">No trackers configured.</td></tr>
 {{end}}
 </table>
-<form id="sf" style="margin-top:1em;">
+<form id="sf" style="margin-top:12px;">
 <input name="host" placeholder="nekobt.to" required>
 <input name="key" placeholder="your passkey" required size="40">
 <button type="submit" class="primary">Add / update</button>
-<span id="ss"></span>
+<span id="ss" class="small"></span>
 </form>
 
 <script>
@@ -238,7 +489,8 @@ async function delHost(h) {
     if (r.ok) location.reload();
 }
 </script>
-</body></html>`))
+{{end}}
+`, nil)
 
 func (u *LocalUI) handleIndex(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path != "/" {
@@ -250,11 +502,436 @@ func (u *LocalUI) handleIndex(w http.ResponseWriter, r *http.Request) {
 	for _, k := range config.ConfigYmlKeys {
 		rows = append(rows, row{Key: k, Value: u.cfg.Layered.Effective(k), Source: sourceFor(u.cfg.Layered, k)})
 	}
+	data := u.baseData("config", "", "")
+	data["Writable"] = u.cfg.Layered.Writable()
+	data["Rows"] = rows
+	data["SecretsHosts"] = u.secrets.List()
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	_ = localUITmpl.Execute(w, map[string]any{
-		"BindAddr":     u.bindAddr,
-		"Writable":     u.cfg.Layered.Writable(),
-		"Rows":         rows,
-		"SecretsHosts": u.secrets.List(),
-	})
+	_ = localUITmpl.Execute(w, data)
+}
+
+// ── Groups ────────────────────────────────────────────────────────────────
+//
+// Groups are edited exclusively from the local UI for now (no /api prefix,
+// no auth) because the whole localui is loopback-only. Once we add an auth
+// layer (planned for when the offline pipeline goes GA) the same handlers
+// can mount under an authenticated mux without being rewritten.
+
+func (u *LocalUI) handleGroups(w http.ResponseWriter, r *http.Request) {
+	if u.db == nil {
+		http.Error(w, "database not initialised", http.StatusServiceUnavailable)
+		return
+	}
+	groups, err := u.db.ListGroups()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	data := u.baseData("groups", r.URL.Query().Get("msg"), r.URL.Query().Get("err"))
+	data["Groups"] = groups
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	_ = groupsTmpl.Execute(w, data)
+}
+
+func (u *LocalUI) handleGroupCreate(w http.ResponseWriter, r *http.Request) {
+	if u.db == nil {
+		http.Error(w, "database not initialised", http.StatusServiceUnavailable)
+		return
+	}
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	g, err := groupFromForm(r)
+	if err != nil {
+		redirectGroups(w, r, "", err.Error())
+		return
+	}
+	if err := u.db.CreateGroup(g); err != nil {
+		redirectGroups(w, r, "", err.Error())
+		return
+	}
+	redirectGroups(w, r, "created "+g.Name, "")
+}
+
+func (u *LocalUI) handleGroupUpdate(w http.ResponseWriter, r *http.Request) {
+	if u.db == nil {
+		http.Error(w, "database not initialised", http.StatusServiceUnavailable)
+		return
+	}
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	g, err := groupFromForm(r)
+	if err != nil {
+		redirectGroups(w, r, "", err.Error())
+		return
+	}
+	if err := u.db.UpdateGroup(g); err != nil {
+		redirectGroups(w, r, "", err.Error())
+		return
+	}
+	redirectGroups(w, r, "updated "+g.Name, "")
+}
+
+func (u *LocalUI) handleGroupDelete(w http.ResponseWriter, r *http.Request) {
+	if u.db == nil {
+		http.Error(w, "database not initialised", http.StatusServiceUnavailable)
+		return
+	}
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	id, err := strconv.ParseInt(r.PostFormValue("id"), 10, 64)
+	if err != nil || id <= 0 {
+		redirectGroups(w, r, "", "invalid id")
+		return
+	}
+	if err := u.db.DeleteGroup(id); err != nil {
+		redirectGroups(w, r, "", err.Error())
+		return
+	}
+	redirectGroups(w, r, "deleted", "")
+}
+
+// groupFromForm parses the shared create/update form into a Group. The id
+// field is optional (create path leaves it 0); everything else is validated
+// in storage.validateGroup so this stays thin.
+func groupFromForm(r *http.Request) (*storage.Group, error) {
+	if err := r.ParseForm(); err != nil {
+		return nil, err
+	}
+	g := &storage.Group{Source: "local"}
+	if s := r.PostFormValue("id"); s != "" {
+		id, err := strconv.ParseInt(s, 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("invalid id: %v", err)
+		}
+		g.ID = id
+	}
+	g.Name = r.PostFormValue("name")
+	// Newsgroups entered one per line in the textarea, but accept commas
+	// and whitespace too so copy-paste from anywhere works.
+	raw := r.PostFormValue("newsgroups")
+	for _, line := range strings.FieldsFunc(raw, func(r rune) bool {
+		return r == '\n' || r == '\r' || r == ',' || r == ' ' || r == '\t'
+	}) {
+		g.Newsgroups = append(g.Newsgroups, line)
+	}
+	g.Screenshots = parseOptInt(r.PostFormValue("screenshots"))
+	g.Par2Redundancy = parseOptInt(r.PostFormValue("par2_redundancy"))
+	if v := r.PostFormValue("obfuscate"); v != "" {
+		b := v == "1" || strings.EqualFold(v, "true") || strings.EqualFold(v, "yes")
+		g.Obfuscate = &b
+	}
+	g.WatermarkText = strings.TrimSpace(r.PostFormValue("watermark_text"))
+	g.Type = strings.TrimSpace(r.PostFormValue("type"))
+	g.SampleSeconds = parseOptInt(r.PostFormValue("sample_seconds"))
+	// Banned extensions: accept one-per-line or comma-separated, validate
+	// normalises dots and case so the operator can paste loose input.
+	rawBans := r.PostFormValue("banned_extensions")
+	for _, ext := range strings.FieldsFunc(rawBans, func(r rune) bool {
+		return r == '\n' || r == '\r' || r == ',' || r == ' ' || r == '\t'
+	}) {
+		g.BannedExtensions = append(g.BannedExtensions, ext)
+	}
+	return g, nil
+}
+
+// parseOptInt returns nil for blank input so "inherit global default"
+// survives a form round-trip; non-empty but invalid falls through to nil
+// for the same reason — the UI's numeric input prevents that in practice.
+func parseOptInt(s string) *int {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return nil
+	}
+	i, err := strconv.Atoi(s)
+	if err != nil {
+		return nil
+	}
+	return &i
+}
+
+func redirectGroups(w http.ResponseWriter, r *http.Request, msg, errMsg string) {
+	redirectWithFlash(w, r, "/groups", msg, errMsg)
+}
+
+// ── Watch folders ─────────────────────────────────────────────────────────
+//
+// Same UI pattern as /groups: one row per watch with an inline update form,
+// a create form below, and flash messages via redirect query params. The
+// polling watcher goroutine (added in a later commit) consumes the same
+// rows via ListActiveWatches.
+
+func (u *LocalUI) handleWatches(w http.ResponseWriter, r *http.Request) {
+	if u.db == nil {
+		http.Error(w, "database not initialised", http.StatusServiceUnavailable)
+		return
+	}
+	watches, err := u.db.ListWatches()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	// Groups are fetched so the edit/create forms can render a <select>
+	// with human names rather than raw ids; N+1 avoided by doing it once.
+	groups, err := u.db.ListGroups()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	data := u.baseData("watches", r.URL.Query().Get("msg"), r.URL.Query().Get("err"))
+	data["Watches"] = watches
+	data["Groups"] = groups
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	_ = watchesTmpl.Execute(w, data)
+}
+
+func (u *LocalUI) handleWatchCreate(w http.ResponseWriter, r *http.Request) {
+	if u.db == nil {
+		http.Error(w, "database not initialised", http.StatusServiceUnavailable)
+		return
+	}
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	watch, err := watchFromForm(r)
+	if err != nil {
+		redirectWatches(w, r, "", err.Error())
+		return
+	}
+	if err := u.db.CreateWatch(watch); err != nil {
+		redirectWatches(w, r, "", err.Error())
+		return
+	}
+	redirectWatches(w, r, "added "+watch.Path, "")
+}
+
+func (u *LocalUI) handleWatchUpdate(w http.ResponseWriter, r *http.Request) {
+	if u.db == nil {
+		http.Error(w, "database not initialised", http.StatusServiceUnavailable)
+		return
+	}
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	watch, err := watchFromForm(r)
+	if err != nil {
+		redirectWatches(w, r, "", err.Error())
+		return
+	}
+	if err := u.db.UpdateWatch(watch); err != nil {
+		redirectWatches(w, r, "", err.Error())
+		return
+	}
+	redirectWatches(w, r, "updated "+watch.Path, "")
+}
+
+func (u *LocalUI) handleWatchDelete(w http.ResponseWriter, r *http.Request) {
+	if u.db == nil {
+		http.Error(w, "database not initialised", http.StatusServiceUnavailable)
+		return
+	}
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	id, err := strconv.ParseInt(r.PostFormValue("id"), 10, 64)
+	if err != nil || id <= 0 {
+		redirectWatches(w, r, "", "invalid id")
+		return
+	}
+	if err := u.db.DeleteWatch(id); err != nil {
+		redirectWatches(w, r, "", err.Error())
+		return
+	}
+	redirectWatches(w, r, "deleted", "")
+}
+
+func watchFromForm(r *http.Request) (*storage.WatchFolder, error) {
+	if err := r.ParseForm(); err != nil {
+		return nil, err
+	}
+	wf := &storage.WatchFolder{}
+	if s := r.PostFormValue("id"); s != "" {
+		id, err := strconv.ParseInt(s, 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("invalid id: %v", err)
+		}
+		wf.ID = id
+	}
+	wf.Path = r.PostFormValue("path")
+	if s := strings.TrimSpace(r.PostFormValue("group_id")); s != "" {
+		gid, err := strconv.ParseInt(s, 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("invalid group id: %v", err)
+		}
+		wf.GroupID = &gid
+	}
+	// HTML checkboxes don't post when unchecked — the hidden "enabled_present"
+	// field lets us distinguish "form submitted with box unchecked" from
+	// "field missing entirely" so the update handler can flip enabled to 0.
+	if r.PostFormValue("enabled_present") != "" {
+		wf.Enabled = r.PostFormValue("enabled") == "1"
+	} else {
+		wf.Enabled = true
+	}
+	return wf, nil
+}
+
+func redirectWatches(w http.ResponseWriter, r *http.Request, msg, errMsg string) {
+	redirectWithFlash(w, r, "/watches", msg, errMsg)
+}
+
+// ── Offline jobs ──────────────────────────────────────────────────────────
+//
+// Read-only list for now plus retry/delete. The processor lands in the
+// next commit; until then rows only ever transition between 'queued' and
+// 'failed' via retry, never to 'completed'.
+
+func (u *LocalUI) handleJobs(w http.ResponseWriter, r *http.Request) {
+	if u.db == nil {
+		http.Error(w, "database not initialised", http.StatusServiceUnavailable)
+		return
+	}
+	jobs, err := u.db.ListOfflineJobs(100)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	data := u.baseData("jobs", r.URL.Query().Get("msg"), r.URL.Query().Get("err"))
+	data["Jobs"] = jobs
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	_ = jobsTmpl.Execute(w, data)
+}
+
+func (u *LocalUI) handleJobRetry(w http.ResponseWriter, r *http.Request) {
+	if u.db == nil {
+		http.Error(w, "database not initialised", http.StatusServiceUnavailable)
+		return
+	}
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	id, err := strconv.ParseInt(r.PostFormValue("id"), 10, 64)
+	if err != nil || id <= 0 {
+		redirectJobs(w, r, "", "invalid id")
+		return
+	}
+	if err := u.db.ResetQueuedJob(id); err != nil {
+		redirectJobs(w, r, "", err.Error())
+		return
+	}
+	redirectJobs(w, r, "requeued", "")
+}
+
+func (u *LocalUI) handleJobDelete(w http.ResponseWriter, r *http.Request) {
+	if u.db == nil {
+		http.Error(w, "database not initialised", http.StatusServiceUnavailable)
+		return
+	}
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	id, err := strconv.ParseInt(r.PostFormValue("id"), 10, 64)
+	if err != nil || id <= 0 {
+		redirectJobs(w, r, "", "invalid id")
+		return
+	}
+	if err := u.db.DeleteJob(id); err != nil {
+		redirectJobs(w, r, "", err.Error())
+		return
+	}
+	redirectJobs(w, r, "deleted", "")
+}
+
+func redirectJobs(w http.ResponseWriter, r *http.Request, msg, errMsg string) {
+	redirectWithFlash(w, r, "/jobs", msg, errMsg)
+}
+
+// ── Live events (SSE) ─────────────────────────────────────────────────────
+//
+// /events streams the agent's current speed/state/job-count snapshot every
+// ~1.5s. Every page subscribes via EventSource in the layout's <script>
+// block and updates the sidebar in place — no polling, no page reloads.
+// The 5s site-post loop is the authoritative aggregation cadence; SSE
+// pushes whatever snapshot is most recent, so clients see up-to-5s-old
+// numbers in between aggregations. Good enough for a sidebar; the graph
+// just repeats a point until the next aggregation.
+func (u *LocalUI) handleEvents(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no") // stop nginx/gluetun proxies from buffering
+
+	rc := http.NewResponseController(w)
+	// The server has a 10s WriteTimeout that would kill a long-lived SSE
+	// connection. Disable it on this response only.
+	_ = rc.SetWriteDeadline(time.Time{})
+
+	ticker := time.NewTicker(1500 * time.Millisecond)
+	defer ticker.Stop()
+
+	writeEvent := func() bool {
+		snap := GetLiveSnapshot()
+		payload := map[string]any{
+			"phase":            snap.Phase,
+			"task_title":       snap.TaskTitle,
+			"download_mbps":    snap.DownloadMBps,
+			"upload_mbps":      snap.UploadMBps,
+			"vpn_status":       snap.VPNStatus,
+			"public_ip":        snap.PublicIP,
+			"disk_free_gb":     snap.DiskFreeGB,
+			"disk_reserved_gb": snap.DiskReservedGB,
+		}
+		if u.db != nil {
+			// Job counts per status — drive sidebar badges and also catches
+			// the case where the operator opens the UI mid-job to see "1
+			// processing" without having to refresh.
+			if counts, err := u.db.CountJobsByStatus(); err == nil {
+				payload["jobs"] = counts
+			}
+		}
+		body, _ := json.Marshal(payload)
+		if _, err := fmt.Fprintf(w, "event: status\ndata: %s\n\n", body); err != nil {
+			return false
+		}
+		return rc.Flush() == nil
+	}
+
+	// Send an initial event immediately so the sidebar doesn't show zeros
+	// for up to 1.5s after page load.
+	if !writeEvent() {
+		return
+	}
+	for {
+		select {
+		case <-r.Context().Done():
+			return
+		case <-ticker.C:
+			if !writeEvent() {
+				return
+			}
+		}
+	}
+}
+
+// redirectWithFlash is the shared tail for all CRUD handlers — POST-Redirect-GET
+// with a single query param carrying the success or error message. Keeps
+// flash state out of sessions/cookies, which the local UI doesn't have.
+func redirectWithFlash(w http.ResponseWriter, r *http.Request, path, msg, errMsg string) {
+	q := ""
+	if msg != "" {
+		q = "?msg=" + template.URLQueryEscaper(msg)
+	} else if errMsg != "" {
+		q = "?err=" + template.URLQueryEscaper(errMsg)
+	}
+	http.Redirect(w, r, path+q, http.StatusSeeOther)
 }

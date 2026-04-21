@@ -24,6 +24,13 @@ import (
 
 const ChunkSize = 700 * 1024 // 700KB — Nyuu/Usenet standard article size
 
+// UploadSlot serialises Usenet uploads across the whole agent so the
+// online (site-polling) and offline (watch-folder) paths share NNTP
+// connection budget. Callers acquire the lock before UploadDirectory
+// and release it after — holding it across progress reporting keeps the
+// UI phase ("queued for upload" vs "uploading") accurate.
+var UploadSlot sync.Mutex
+
 // bufPool reuses chunk read buffers to avoid per-chunk allocation.
 var bufPool = sync.Pool{
 	New: func() interface{} {

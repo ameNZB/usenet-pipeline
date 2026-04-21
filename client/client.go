@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"time"
 	"github.com/ameNZB/usenet-pipeline/config"
 )
@@ -43,32 +44,53 @@ type SiteClient struct {
 	baseURL string
 	token   string
 	http    *http.Client
+	// lastOKNano is the UnixNano timestamp of the most recent RoundTrip
+	// that returned a response (any status). Populated by the transport
+	// wrapper below and read by the watchdog to detect extended
+	// site-unreachability (e.g. VPN tunnel dropped, DNS broken).
+	lastOKNano atomic.Int64
 }
 
 // versionHeaderTransport adds X-Agent-Protocol and X-Agent-Version to every
 // outbound request so the site can gate agents below its required minimum
-// protocol version. Wrapping the transport keeps the header plumbing out of
-// every individual request builder in this package.
+// protocol version, and records the timestamp of any successful roundtrip
+// so the watchdog can act on sustained network failure.
 type versionHeaderTransport struct {
-	inner http.RoundTripper
+	inner  http.RoundTripper
+	client *SiteClient
 }
 
 func (t *versionHeaderTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	req.Header.Set("X-Agent-Protocol", fmt.Sprintf("%d", AgentProtocolVersion))
 	req.Header.Set("X-Agent-Version", AgentVersion)
-	return t.inner.RoundTrip(req)
+	resp, err := t.inner.RoundTrip(req)
+	if err == nil && t.client != nil {
+		t.client.lastOKNano.Store(time.Now().UnixNano())
+	}
+	return resp, err
 }
 
 // New creates a SiteClient from config.
 func New(cfg *config.Config) *SiteClient {
-	return &SiteClient{
+	c := &SiteClient{
 		baseURL: cfg.SiteURL,
 		token:   cfg.AgentToken,
-		http: &http.Client{
-			Timeout:   120 * time.Second,
-			Transport: &versionHeaderTransport{inner: http.DefaultTransport},
-		},
 	}
+	// Seed lastOK with the current time so the watchdog doesn't fire on
+	// startup before any request has had a chance to complete.
+	c.lastOKNano.Store(time.Now().UnixNano())
+	c.http = &http.Client{
+		Timeout:   120 * time.Second,
+		Transport: &versionHeaderTransport{inner: http.DefaultTransport, client: c},
+	}
+	return c
+}
+
+// LastOK returns the timestamp of the most recent successful HTTP roundtrip
+// to the site. A roundtrip is "successful" if the transport got a response
+// (any status code), which is enough to prove DNS + TCP + TLS all worked.
+func (c *SiteClient) LastOK() time.Time {
+	return time.Unix(0, c.lastOKNano.Load())
 }
 
 // UpgradeRequiredError is returned when the site refuses the agent because
@@ -248,6 +270,66 @@ func (c *SiteClient) PostLocalConfig(report config.SettingsReport) error {
 	}
 	resp.Body.Close()
 	return nil
+}
+
+// SiteAgentGroup mirrors the site's AgentGroup model. Decoded verbatim
+// from GET /api/agent/groups; the caller converts it into the local
+// storage.Group shape (source='site') before upserting into SQLite.
+// Field types match the site: *int / *bool for nullable overrides,
+// []string for the array columns.
+type SiteAgentGroup struct {
+	ID               int      `json:"id"`
+	Name             string   `json:"name"`
+	Type             string   `json:"type"`
+	Newsgroups       []string `json:"newsgroups"`
+	BannedExtensions []string `json:"banned_extensions"`
+	Screenshots      *int     `json:"screenshots,omitempty"`
+	SampleSeconds    *int     `json:"sample_seconds,omitempty"`
+	Par2Redundancy   *int     `json:"par2_redundancy,omitempty"`
+	Obfuscate        *bool    `json:"obfuscate,omitempty"`
+	WatermarkText    string   `json:"watermark_text"`
+	Version          int      `json:"version"`
+}
+
+// AgentGroupsResponse is the wire shape of GET /api/agent/groups:
+// {max_version: N, groups: [...]}. The agent uses max_version as the
+// since_version query param on its next poll so a steady-state fetch
+// (no changes) is a single-int comparison server-side.
+type AgentGroupsResponse struct {
+	MaxVersion int              `json:"max_version"`
+	Groups     []SiteAgentGroup `json:"groups"`
+}
+
+// FetchAgentGroups pulls the site-managed catalog of posting groups.
+// sinceVersion should be the agent's last-seen max_version from the
+// previous poll (0 on first boot).
+//
+// A 404 means the site hasn't shipped this endpoint yet — treat as
+// empty rather than an error so old sites don't break new agents.
+func (c *SiteClient) FetchAgentGroups(sinceVersion int) (*AgentGroupsResponse, error) {
+	url := fmt.Sprintf("%s/api/agent/groups?since_version=%d", c.baseURL, sinceVersion)
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+c.token)
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		// Site hasn't been upgraded — treat as "no groups yet".
+		return &AgentGroupsResponse{Groups: []SiteAgentGroup{}}, nil
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("agent groups returned %d", resp.StatusCode)
+	}
+	var out AgentGroupsResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, err
+	}
+	return &out, nil
 }
 
 // Directive is a queued instruction from the site. Currently only

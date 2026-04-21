@@ -17,8 +17,25 @@ services:
       # The agent connects to vpn:1080 for torrent traffic only.
       - SOCKS5=on
       - SOCKS5_LISTENING_ADDRESS=:1080
+      # Gluetun HTTP control server (default :8000). The watchdog hits this
+      # on 127.0.0.1:8000 from the shared netns when the site has been
+      # unreachable for a while — no need to publish it to the host.
+      - HTTP_CONTROL_SERVER_ADDRESS=:8000
+      # Allow DNS lookups to Docker's embedded resolver. Containers sharing
+      # this netns (i.e. the agent below) get /etc/resolv.conf pointing at
+      # 127.0.0.11 by default; without this, gluetun's firewall blocks
+      # outbound UDP to 127.0.0.11:53 with "operation not permitted" and
+      # every site/NNTP/tracker hostname fails to resolve. The DNS query
+      # itself then forwards through Docker's configured upstream, which
+      # still originates from gluetun's tunnel — no leak.
+      - FIREWALL_OUTBOUND_SUBNETS=127.0.0.11/32
     ports:
-      - "8080:8080"
+      # Agent's local config UI. The agent runs in this netns (network_mode:
+      # service:vpn on the agent service), so its listen ports are actually
+      # owned by this container. Bound to 127.0.0.1 on the host so LAN peers
+      # can't edit config/secrets; change the host side if you want remote
+      # access (and put a reverse proxy with auth in front of it).
+      - "127.0.0.1:${LOCAL_UI_PORT:-4869}:${LOCAL_UI_PORT:-4869}"
     volumes:
       - ${DATA_DIR:-./data}/gluetun:/gluetun
     restart: unless-stopped
@@ -61,6 +78,14 @@ services:
       # Processing
       - ENCRYPT=${ENCRYPT:-true}
       - PAR2_REDUNDANCY=${PAR2_REDUNDANCY:-5}
+      # Local config UI. Must bind 0.0.0.0 inside the container so the host
+      # port mapping on the vpn service above can reach it — binding 127.0.0.1
+      # inside docker would be unreachable from the host even with -p.
+      - LOCAL_UI_PORT=${LOCAL_UI_PORT:-4869}
+      - LOCAL_UI_BIND=0.0.0.0
     volumes:
+      # Bind-mount so users can drop torrents into watch folders and see
+      # generated NZBs from the host without docker cp / exec. DATA_DIR
+      # defaults to ./data next to the compose file.
       - ${DATA_DIR:-./data}/agent:/data
     restart: unless-stopped

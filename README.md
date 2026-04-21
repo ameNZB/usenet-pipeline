@@ -1,24 +1,39 @@
 # usenet-pipeline
 
-A self-hosted agent that automates the torrent-to-Usenet pipeline: downloads torrents, extracts media metadata, generates PAR2 recovery, optionally encrypts, uploads to Usenet via NNTP, and reports back to a companion indexer site with a complete NZB.
+A self-hosted agent that automates the torrent-to-Usenet pipeline: downloads torrents, extracts media metadata, generates PAR2 recovery, optionally encrypts, uploads to Usenet via NNTP, and produces an NZB — either reported back to a companion indexer site or saved to a local output folder for standalone/offline use.
 
 Designed to run on a VPS behind a VPN with zero manual intervention.
 
 ## Features
 
-- Torrent downloading via magnet links (anacrolix/torrent, pure Go)
+**Pipeline**
+- Torrent downloading via magnet links or private `.torrent` files (anacrolix/torrent, pure Go)
 - Private tracker support with `secrets.yml` passkey store and DHT avoidance
 - Usenet uploading with parallel NNTP connections and yEnc encoding
 - PAR2 recovery block generation (parpar or par2cmdline)
 - Optional 7z encryption with header obfuscation
 - Optional filename obfuscation (random hex subjects)
 - Media analysis via ffprobe (codec, resolution, HDR detection)
-- Automatic screenshot capture via ffmpeg
+- Type-aware sampling: video screenshots, manga page extracts, music clips
+- Optional screenshot watermarking
 - VPN integration via gluetun (full-tunnel or split-tunnel)
+
+**Standalone / offline uploads**
+- Watch folders — drop a `.torrent`, a completed release folder, or a single media file and the agent produces an NZB locally
+- Groups concept — each watch folder is tagged with a group that controls newsgroups, sampling strategy, PAR2%, obfuscation, watermark, and a per-group banned-extensions list
+- Output layout per-release: `<group>/<title>/{title.nzb, screenshots/, password.txt}`
+- Site-push sync — when a companion site publishes a catalog at `GET /api/agent/groups`, the agent pulls it in and upserts as `source='site'`. Locally-defined groups always win
+
+**Local web UI** (loopback-only by default)
+- Sidebar with live speed + VPN + disk widgets, two-colour speed sparkline via SSE
+- Edit `config.yml` + private-tracker passkeys without SSH
+- CRUD for groups, watch folders, job history
+- `/events` SSE stream for building your own dashboards
+
+**Resilience**
+- Agent self-heal: if the site has been unreachable for 5 min, the agent pokes gluetun's HTTP control API to reconnect; after 10 min it exits for the supervisor to restart
 - Disk space reservation and CPU throttling
-- Slow/dead download detection and automatic rejection
-- Live status reporting to companion site (speed, phase, VPN IP)
-- Web-configurable settings (no restart needed for most changes)
+- Slow/dead download detection and automatic rejection (even for torrents stuck at 99.x%)
 - Versioned agent↔site protocol with upgrade gating and maintenance-mode backoff
 - Failed-completion backfill: on-disk NZB snapshots auto-resubmitted on restart
 
@@ -108,6 +123,19 @@ AGENT_NETWORK_MODE=bridge
 
 Gluetun exposes a SOCKS5 proxy on port 1080. The torrent client is automatically configured to use it.
 
+## Agent Self-Heal
+
+The agent has a small watchdog goroutine that nudges a stuck VPN back to life before resorting to a full process restart. It tracks the last successful HTTP roundtrip to the site and escalates:
+
+| Stalled for | Action |
+|-------------|--------|
+| ≥ 5 min | `PUT /v1/openvpn/status` + `/v1/wireguard/status` on `GLUETUN_CONTROL_URL` (default `http://127.0.0.1:8000` — same netns as the agent). 3-minute cooldown between attempts. |
+| ≥ 10 min | `os.Exit(1)` so `restart: unless-stopped` / systemd can take over with a fresh process. |
+
+Requires gluetun's HTTP control server on — the stock `docker-compose.yml` sets `HTTP_CONTROL_SERVER_ADDRESS=:8000` explicitly so this works out of the box.
+
+A separate change in the same release raised the torrent stall-cancel's percent gate: a torrent stuck at 99.x % with 0 peers now gets rejected after `torrent_no_full_seed_timeout_mins`, same as one stuck earlier. Dead torrents no longer hold slots forever.
+
 ## How It Works
 
 ```
@@ -143,15 +171,65 @@ Poll for next task
 | (VPN)    |     |          |     | (Usenet)  |
 +----------+     +----+-----+     +-----------+
                       |
-                      | HTTPS
-                      v
-                +----------+
-                | Indexer   |
-                | Site      |
-                +----------+
+           +----------+----------+
+           | HTTPS              local
+           v              ./data/agent/offline-output
+     +-----------+
+     | Indexer   |
+     | Site      |
+     +-----------+
 ```
 
-In full-tunnel mode, all traffic goes through gluetun. In split-tunnel mode, only torrent traffic uses the VPN's SOCKS5 proxy.
+In full-tunnel mode, all traffic goes through gluetun. In split-tunnel mode, only torrent traffic uses the VPN's SOCKS5 proxy. Watch-folder jobs write their NZBs to `OFFLINE_OUTPUT_DIR` on disk instead of posting back to the site.
+
+## Offline Uploads
+
+Separate from the site-polling loop, the agent can watch filesystem folders and turn dropped content into NZBs on its own — useful for posting your own library, for sites that don't (yet) implement the agent protocol, or as a backup destination alongside the normal flow.
+
+### Concepts
+
+- **Group** — a posting category. Name, type (`video` / `manga` / `music` / any custom label), list of newsgroups, and per-group overrides: sample count, audio sample seconds, PAR2 %, obfuscation, watermark text, banned-extensions blocklist. Groups are either edited locally via the UI or pushed down from the site (`source='site'`).
+- **Watch folder** — an absolute path on disk tagged with one group. Every file or subfolder that appears under it becomes a queued job.
+- **Offline job** — tracks one detected input through the pipeline: `queued → processing → completed | failed`. Retry / delete actions available from the `/jobs` page.
+
+### Flow
+
+1. Open the local UI (`http://localhost:4869/` by default).
+2. **Groups** page: create a group, pick its type, paste your target newsgroups (one per line — multiple newsgroups produce a cross-post).
+3. **Watches** page: add a watch folder, point it at an absolute path, assign the group.
+4. Drop a `.torrent`, a release folder, or a single media file into that path.
+5. Within ~15 seconds it appears on the **Jobs** page as `queued`; the processor claims it, downloads/stages/PAR2s/uploads, and writes:
+
+   ```
+   $OFFLINE_OUTPUT_DIR/<group-name>/<title>/
+     ├── <title>.nzb
+     ├── screenshots/    # or samples/ (manga pages, audio clips, depending on type)
+     └── password.txt    # only when ENCRYPT=true
+   ```
+
+### Type-aware sampling
+
+Each group has a `type` that selects which preview the agent generates:
+
+| Type | What it samples |
+|------|-----------------|
+| `video` | PNG screenshots via ffmpeg, evenly spaced across the middle 90% of the longest video file. Optional watermark drawn in the bottom-right. |
+| `manga` | Pages extracted from the first CBZ/CBR/EPUB archive found. |
+| `music` | MP3 clips (VBR ~165 kbps) of configurable duration from the longest audio track. |
+| *(other)* | Sampling skipped; the NZB is still produced and posted. |
+
+Set `type` in the Groups UI. Unknown / custom values (e.g. `audiobook`, `software`) don't cause errors — the agent just posts raw files without a preview. This keeps custom site-pushed types forward-compatible.
+
+### Per-group blocklist
+
+Each group carries a list of extensions to strip from the release before staging. An empty list inherits the hardcoded default (the 90-entry Microsoft "high-risk file types" set + common scripts/executables). A non-empty list *replaces* the default — useful when:
+
+- a music group legitimately ships `.iso` alongside audio
+- a video group wants to additionally block `.html` / `.url`
+
+### Output path
+
+`OFFLINE_OUTPUT_DIR` defaults to `$TempDir/../offline-output`. With the stock docker-compose bind-mount that resolves to `./data/agent/offline-output` on the host.
 
 ## Configuration Layers
 
@@ -176,7 +254,19 @@ Most settings can be changed from the site UI without restarting:
 
 ## Local UI
 
-The agent also serves a small loopback-only page for editing secrets and on-disk config without the site. Enable by setting `LOCAL_UI_PORT`; bind beyond `127.0.0.1` with `LOCAL_UI_BIND` (not recommended). Auth token is stored in `secrets.yml` alongside any private-tracker passkeys — neither ever leaves the agent.
+The agent serves a browser UI at `http://localhost:${LOCAL_UI_PORT}/` (default `4869`, published by docker-compose bound to `127.0.0.1` on the host). Five pages + an SSE stream:
+
+| Path | What it does |
+|------|--------------|
+| `/` | Edit `config.yml` keys and private-tracker passkeys in `secrets.yml`. Each row shows which tier the current value came from (env / yml / default). |
+| `/groups` | CRUD for posting groups — name, type, newsgroups, overrides, watermark, banned extensions. Site-pushed rows (`source='site'`) render read-only. |
+| `/watches` | CRUD for watch folders. Each folder is tagged with a group. |
+| `/jobs` | Offline job history — status badge, phase, created timestamp, retry/delete actions. |
+| `/events` | Server-sent events. Pushes a snapshot every ~1.5 s: phase, MB/s, VPN state, disk free/reserved, job counts per status. The layout's sidebar subscribes to it for the live speed graph and the active-jobs count badge next to the Jobs nav link. |
+
+Bind beyond `127.0.0.1` by setting `LOCAL_UI_BIND` (not recommended unless you put a reverse proxy with auth in front — nothing in `/`, `/groups`, or `/secrets` requires login yet).
+
+Passkeys and secrets stay on the agent's disk at all times — the site is told *that* trackers are configured, never the keys.
 
 ## Private Trackers
 
@@ -205,8 +295,10 @@ Passkeys are edited via the local UI only. The site never sees them.
 | `GENERATOR_NAME` | `usenet-pipeline` | NZB `x-generator` header value |
 | `VPN_PROXY_ADDR` | `vpn:1080` | Gluetun SOCKS5 proxy address (split-tunnel) |
 | `DATA_DIR` | `./data` | Host dir for agent state, downloads, gluetun config |
-| `LOCAL_UI_PORT` | *(unset)* | Enable local UI on this port (loopback) |
-| `LOCAL_UI_BIND` | `127.0.0.1` | Address the local UI listens on |
+| `LOCAL_UI_PORT` | `4869` | Local UI port (published to `127.0.0.1` on the host by docker-compose) |
+| `LOCAL_UI_BIND` | `127.0.0.1` (`0.0.0.0` inside docker) | Address the local UI listens on inside the container |
+| `OFFLINE_OUTPUT_DIR` | `<TempDir>/../offline-output` | Where offline-job NZBs + sidecars get written |
+| `GLUETUN_CONTROL_URL` | `http://127.0.0.1:8000` | Watchdog target for VPN restart. Lives in the shared netns — no exposure to the host needed. |
 
 ### Tunable via `config.yml` / web UI
 
@@ -277,7 +369,7 @@ The agent talks to its companion site over a small JSON/HTTPS protocol. This sec
 - **Auth**: `Authorization: Bearer <AGENT_TOKEN>` on every request. Tokens are opaque strings issued per-agent by your server.
 - **Version headers** (sent on every request):
   - `X-Agent-Protocol: <int>` — current protocol is `2`.
-  - `X-Agent-Version: <string>` — build version (e.g. `1.1.0`). Informational.
+  - `X-Agent-Version: <string>` — build version (e.g. `1.2.0`). Informational.
 - **Content**: JSON unless noted. Large payloads (`/complete`, `/backfill`, `/screenshot`) are **gzipped multipart** (`Content-Encoding: gzip`, `Content-Type: multipart/form-data; boundary=...`).
 - **Timeouts**: agent uses a 120s HTTP timeout per request.
 
@@ -397,6 +489,38 @@ Queued instructions for this agent. The agent acks each one after processing it.
 
 - **Request body**: `{"id": <int64>, "error": ""}` — `error` is empty on success, message on failure.
 - **Response**: ignored.
+
+#### `GET /api/agent/groups`
+
+Optional. Publishes a catalog of posting groups for the agent to upsert into its local DB with `source='site'`. Returning `404` is allowed — the agent treats it as "no catalog" and keeps running with locally-defined groups only.
+
+- **Query**: `?since_version=N` where `N` is the `max_version` the agent received on its previous poll (`0` on first boot and after a reconciliation pass).
+- **Response**:
+  ```json
+  {
+    "max_version": 42,
+    "groups": [
+      {
+        "id": 1,
+        "name": "anime",
+        "type": "video",
+        "newsgroups": ["alt.binaries.multimedia.anime.highspeed"],
+        "banned_extensions": [".exe", ".html"],
+        "screenshots": 6,
+        "sample_seconds": null,
+        "par2_redundancy": 5,
+        "obfuscate": true,
+        "watermark_text": "-YourTag",
+        "version": 42
+      }
+    ]
+  }
+  ```
+  - Nullable fields (`screenshots`, `sample_seconds`, `par2_redundancy`, `obfuscate`) mean "agent falls back to its own default."
+  - `type` is an open string — the agent skips sampling for unknown values but still posts. Lets the server add categories (`audiobook`, `software`, ...) without an agent update.
+  - `max_version` is the current top of the catalog across all rows; the agent sends it back on its next poll so steady-state fetches return an empty `groups` array when nothing's changed.
+- **Delete semantics**: there's no tombstone. The agent performs a full `since_version=0` fetch on startup and deletes any local `source='site'` row whose name isn't in that list. Steady-state polls are incremental only.
+- **Local override wins**: if an agent already has a locally-defined group with the same name, the site's version is logged-and-skipped — operators can delete their local row to let the site take over.
 
 #### `POST /api/agent/poll`
 
@@ -548,7 +672,7 @@ To host an agent compatibly, a server must implement at least:
 - `POST /api/agent/status` — at minimum return `{"ok": true}`.
 - `POST /api/agent/log`, `POST /api/agent/progress` — can be no-ops returning `200`.
 
-The rest (`/local-config`, `/directives`, `/directives/ack`, `/backfill`, `/screenshot`, `/torrent/...`) can be added incrementally; the agent tolerates `404` on the optional ones.
+The rest (`/local-config`, `/directives`, `/directives/ack`, `/backfill`, `/screenshot`, `/torrent/...`, `/groups`) can be added incrementally; the agent tolerates `404` on the optional ones.
 
 Advertise a minimum agent protocol by returning `426 Upgrade Required` with `{"min_protocol":N,"message":"..."}` whenever an older agent calls in.
 

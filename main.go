@@ -225,7 +225,10 @@ func updateTaskProgress(requestID int64, fp *client.FileProgress) {
 }
 
 // aggregateLiveStatus rebuilds the live status from all active task progress entries.
-func aggregateLiveStatus() {
+// Returns the aggregate download + upload speeds in MB/s so the caller can
+// feed them into a separate LiveSnapshot for the local UI (strings are what
+// site posts need; floats are what sparkline / sidebar JS need).
+func aggregateLiveStatus() (dlMBps, ulMBps float64) {
 	taskProgressMu.RLock()
 	files := make([]client.FileProgress, 0, len(taskProgress))
 	var dlSpeed, ulSpeed float64
@@ -272,13 +275,15 @@ func aggregateLiveStatus() {
 		}
 	}
 	liveStatusMu.Unlock()
+	return dlSpeed, ulSpeed
 }
 
 // startStatusReporter posts the agent's live status to the site every 5 seconds.
 func startStatusReporter(site *client.SiteClient, tempDir string) {
 	ticker := time.NewTicker(5 * time.Second)
+	var lastErrMsg string
 	for range ticker.C {
-		aggregateLiveStatus()
+		dlMBps, ulMBps := aggregateLiveStatus()
 
 		liveStatusMu.RLock()
 		storage.GlobalState.RLock()
@@ -294,13 +299,84 @@ func startStatusReporter(site *client.SiteClient, tempDir string) {
 		}
 		snap.DiskReservedGB = float64(services.TotalReservedBytes()) / 1024 / 1024 / 1024
 
-		resp, _ := site.PostStatus(snap)
+		// Publish the local-UI snapshot (typed floats, minimal fields) for
+		// the SSE endpoint. Separate from the site post so a site outage
+		// doesn't freeze the sidebar, and vice versa.
+		services.SetLiveSnapshot(services.LiveSnapshot{
+			Phase:          snap.Phase,
+			TaskTitle:      snap.TaskTitle,
+			DownloadMBps:   dlMBps,
+			UploadMBps:     ulMBps,
+			VPNStatus:      snap.VPNStatus,
+			PublicIP:       snap.PublicIP,
+			DiskFreeGB:     snap.DiskFreeGB,
+			DiskReservedGB: snap.DiskReservedGB,
+		})
+
+		resp, err := site.PostStatus(snap)
+		// Log the first occurrence of each new error — previously these were
+		// swallowed silently, leaving no trace in agent logs when the site
+		// saw us as offline. Dedup by error string so a sustained outage
+		// doesn't spam every 5s.
+		if err != nil {
+			if msg := err.Error(); msg != lastErrMsg {
+				log.Printf("status post failed: %v", err)
+				lastErrMsg = msg
+			}
+		} else if lastErrMsg != "" {
+			log.Printf("status post recovered")
+			lastErrMsg = ""
+		}
 		if resp != nil && resp.CancelRequestID > 0 {
 			jobName := fmt.Sprintf("request-%d", resp.CancelRequestID)
 			if cancelFn, ok := storage.JobCancels.Load(jobName); ok {
 				log.Printf("[skip] Cancelling task %s (request %d) by user request", jobName, resp.CancelRequestID)
 				cancelFn.(context.CancelFunc)()
 			}
+		}
+	}
+}
+
+// startWatchdog self-heals from sustained site-unreachability. Runs every
+// 30s and consults site.LastOK():
+//
+//   - after watchdogVPNRestartAfter minutes: ask gluetun to reconnect (common
+//     cause is the VPN tunnel going stale, which takes down the shared
+//     netns's DNS resolver). Respects watchdogVPNCooldown so we don't hammer
+//     the control server if the restart itself doesn't help.
+//   - after watchdogHardExitAfter minutes: exit(1) so the supervisor
+//     (docker restart: unless-stopped, systemd, etc.) can take over. This
+//     only helps if the agent is running under a supervisor — bare
+//     `./indexer-agent` users get the log and a dead process.
+func startWatchdog(site *client.SiteClient) {
+	const (
+		watchdogVPNRestartAfter = 5 * time.Minute
+		watchdogHardExitAfter   = 10 * time.Minute
+		watchdogVPNCooldown     = 3 * time.Minute
+	)
+	ticker := time.NewTicker(30 * time.Second)
+	var lastVPNRestart time.Time
+	for range ticker.C {
+		age := time.Since(site.LastOK())
+		if age < watchdogVPNRestartAfter {
+			continue
+		}
+		if age >= watchdogHardExitAfter {
+			log.Printf("watchdog: no successful site contact for %v — exiting for supervisor to restart", age.Round(time.Second))
+			os.Exit(1)
+		}
+		if time.Since(lastVPNRestart) < watchdogVPNCooldown {
+			continue
+		}
+		log.Printf("watchdog: no site contact for %v — asking gluetun to reconnect", age.Round(time.Second))
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		err := services.RestartVPN(ctx)
+		cancel()
+		lastVPNRestart = time.Now()
+		if err != nil {
+			log.Printf("watchdog: VPN restart failed: %v", err)
+		} else {
+			log.Printf("watchdog: VPN restart requested")
 		}
 	}
 }
@@ -324,8 +400,9 @@ func startSpeedLogger() {
 
 // ── Upload serialization ────────────────────────────────────────────────────
 
-// uploadMu ensures only one task uploads to Usenet at a time (shared NNTP connections).
-var uploadMu sync.Mutex
+// Upload serialization lives in services.UploadSlot so the offline
+// pipeline can share the same mutex — NNTP connection limits apply
+// regardless of whether the job came from site polling or a watch folder.
 
 // ── Active task tracking (prevents double-dispatch) ─────────────────────────
 
@@ -450,6 +527,24 @@ func main() {
 	storage.StateFile = filepath.Join(cfg.TempDir, "state.json")
 	storage.LoadState()
 
+	// Open the agent's local SQLite DB. Used by the local UI for
+	// user-defined groups + watch folders + offline job history. A
+	// failure here is non-fatal: the existing site-polling path doesn't
+	// touch the DB, so we log and leave it nil. The local UI handlers
+	// detect db==nil and return 503 on the DB-backed routes.
+	db, err := storage.OpenDB(filepath.Join(cfg.TempDir, "agent.db"))
+	if err != nil {
+		log.Printf("WARNING: local DB failed to open (%v) — groups/watch-folders UI disabled", err)
+		db = nil
+	} else {
+		// A crash or kill during processing would leave jobs stranded in
+		// the 'processing' state forever. Put them back in the queue on
+		// boot so the watcher/processor can pick them up again.
+		if n, err := db.RequeueStuckJobs(); err == nil && n > 0 {
+			log.Printf("requeued %d stuck offline job(s) from previous run", n)
+		}
+	}
+
 	// Restore the per-request oversize cooldown set so a restart doesn't
 	// turn the cooldown into a single expensive metadata fetch. Sibling of
 	// state.json so the operator only has to know about TempDir.
@@ -465,7 +560,7 @@ func main() {
 	// Secrets + optional local UI. Both are no-ops when the operator hasn't
 	// enabled them (LOCAL_UI_PORT unset, secrets.yml missing).
 	secrets := services.LoadSecrets()
-	localUI := services.StartLocalUI(cfg, secrets)
+	localUI := services.StartLocalUI(cfg, secrets, db)
 
 	site := client.New(cfg)
 	pollInterval := time.Duration(cfg.PollInterval) * time.Second
@@ -485,6 +580,17 @@ func main() {
 
 	go startStatusReporter(site, cfg.TempDir)
 	go startSpeedLogger()
+	go startWatchdog(site)
+	// Offline watcher + processor pair: watcher queues new files, processor
+	// runs them through the pipeline and writes NZBs to OFFLINE_OUTPUT_DIR.
+	// Both no-op when db is nil (DB failed to open on startup).
+	go services.StartOfflineWatcher(context.Background(), db)
+	go services.StartOfflineProcessor(context.Background(), cfg, db)
+	// Site-groups sync: periodically pull the site's curated catalog of
+	// posting groups into the local DB so watch folders can target them.
+	// Preserves locally-edited groups (rows with source='local'); only
+	// source='site' rows get upserted or reconciled.
+	go services.StartSiteGroupsSync(context.Background(), site, db)
 
 	maxDL := cfg.MaxConcurrentDownloads
 	if maxDL < 1 {
@@ -693,87 +799,14 @@ func main() {
 	}
 }
 
-// videoExtensions for finding the main video file(s) in a download.
-var videoExts = map[string]bool{
-	".mkv": true, ".mp4": true, ".avi": true, ".m2ts": true,
-	".ts": true, ".wmv": true, ".flv": true, ".webm": true, ".mov": true,
-}
+// Blocklist enforcement lives in services.RemoveBlockedFiles — both the
+// online pipeline (this file) and the offline pipeline call it with a
+// per-job effective list so a music group can allow .iso, a video group
+// can ban .html, etc. See services/blocklist.go.
 
-// blockedExts contains dangerous file types that must not be uploaded.
-var blockedExts = map[string]bool{
-	".ade": true, ".adp": true, ".app": true, ".application": true, ".appref-ms": true,
-	".asp": true, ".aspx": true, ".asx": true, ".bas": true, ".bat": true, ".bgi": true,
-	".cab": true, ".cer": true, ".chm": true, ".cmd": true, ".cnt": true, ".com": true,
-	".cpl": true, ".crt": true, ".csh": true, ".der": true, ".diagcab": true, ".exe": true,
-	".fxp": true, ".gadget": true, ".grp": true, ".hlp": true, ".hpj": true, ".hta": true,
-	".htc": true, ".inf": true, ".ins": true, ".iso": true, ".isp": true, ".its": true,
-	".jar": true, ".jnlp": true, ".js": true, ".jse": true, ".ksh": true, ".lnk": true,
-	".mad": true, ".maf": true, ".mag": true, ".mam": true, ".maq": true, ".mar": true,
-	".mas": true, ".mat": true, ".mau": true, ".mav": true, ".maw": true, ".mcf": true,
-	".mda": true, ".mdb": true, ".mde": true, ".mdt": true, ".mdw": true, ".mdz": true,
-	".msc": true, ".msh": true, ".msh1": true, ".msh2": true, ".mshxml": true,
-	".msh1xml": true, ".msh2xml": true, ".msi": true, ".msp": true, ".mst": true,
-	".msu": true, ".ops": true, ".osd": true, ".pcd": true, ".pif": true, ".pl": true,
-	".plg": true, ".prf": true, ".prg": true, ".printerexport": true, ".ps1": true,
-	".ps1xml": true, ".ps2": true, ".ps2xml": true, ".psc1": true, ".psc2": true,
-	".psd1": true, ".psdm1": true, ".pst": true, ".py": true, ".pyc": true, ".pyo": true,
-	".pyw": true, ".pyz": true, ".pyzw": true, ".reg": true, ".scf": true, ".scr": true,
-	".sct": true, ".shb": true, ".shs": true, ".sln": true, ".theme": true, ".tmp": true,
-	".url": true, ".vb": true, ".vbe": true, ".vbp": true, ".vbs": true, ".vcxproj": true,
-	".vhd": true, ".vhdx": true, ".vsmacros": true, ".vsw": true, ".webpnp": true,
-	".website": true, ".ws": true, ".wsc": true, ".wsf": true, ".wsh": true, ".xbap": true,
-	".xll": true, ".xnk": true,
-}
-
-// removeBlockedFiles deletes files with dangerous extensions from a directory.
-// Returns the number of files removed.
-func removeBlockedFiles(dir string) int {
-	removed := 0
-	filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
-		if err != nil || info.IsDir() {
-			return err
-		}
-		ext := strings.ToLower(filepath.Ext(info.Name()))
-		if blockedExts[ext] {
-			log.Printf("Removing blocked file: %s", info.Name())
-			os.Remove(path)
-			removed++
-		}
-		return nil
-	})
-	return removed
-}
-
-// findVideoFiles returns all video files in a directory, sorted largest first.
-func findVideoFiles(dir string) []string {
-	type vf struct {
-		path string
-		size int64
-	}
-	var files []vf
-	filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
-		if err != nil || info.IsDir() {
-			return err
-		}
-		if videoExts[strings.ToLower(filepath.Ext(info.Name()))] {
-			files = append(files, vf{path, info.Size()})
-		}
-		return nil
-	})
-	// Sort largest first — main video is typically the biggest file.
-	for i := 0; i < len(files); i++ {
-		for j := i + 1; j < len(files); j++ {
-			if files[j].size > files[i].size {
-				files[i], files[j] = files[j], files[i]
-			}
-		}
-	}
-	paths := make([]string, len(files))
-	for i, f := range files {
-		paths[i] = f.path
-	}
-	return paths
-}
+// findVideoFiles moved to services.FindVideoFiles so the offline pipeline
+// shares the same list of extensions — divergence would mean screenshots
+// work on one path and not the other.
 
 // dirSize walks a directory and sums file sizes.
 func dirSize(path string) int64 {
@@ -991,8 +1024,11 @@ func processTask(cfg *config.Config, site *client.SiteClient, task *client.Agent
 	}
 	defer os.RemoveAll(downloadedPath)
 
-	// Remove any dangerous file types before processing.
-	if n := removeBlockedFiles(downloadedPath); n > 0 {
+	// Remove any dangerous file types before processing. The online path
+	// has no group context, so it gets the hardcoded default blocklist.
+	// The offline path passes the group's effective list (which may be a
+	// permissive override for music / software releases).
+	if n := services.RemoveBlockedFiles(downloadedPath, services.DefaultBlockedExtensions); n > 0 {
 		log.Printf("[%d] Removed %d blocked file(s) from download", task.RequestID, n)
 	}
 
@@ -1005,7 +1041,7 @@ func processTask(cfg *config.Config, site *client.SiteClient, task *client.Agent
 
 	var videoInfo *services.VideoInfo
 	var screenshots []string
-	videoFiles := findVideoFiles(downloadedPath)
+	videoFiles := services.FindVideoFiles(downloadedPath)
 
 	if len(videoFiles) > 0 {
 		mainVideo := videoFiles[0] // largest video file
@@ -1164,8 +1200,8 @@ func processTask(cfg *config.Config, site *client.SiteClient, task *client.Agent
 		Name: task.Title, Phase: "queued", Size: totalUploadSize,
 	})
 
-	uploadMu.Lock()
-	defer uploadMu.Unlock()
+	services.UploadSlot.Lock()
+	defer services.UploadSlot.Unlock()
 
 	log.Printf("[%d] Step 7: Uploading to Usenet: %.2f MiB via %d connections...",
 		rid, float64(totalUploadSize)/1024/1024, cfg.NNTPConnections)

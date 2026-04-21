@@ -5,9 +5,35 @@ import (
 	"encoding/xml"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 	"github.com/ameNZB/usenet-pipeline/config"
 )
+
+// splitNNTPGroups turns a comma/space-separated newsgroup string into a
+// clean slice, one element per destination. The offline pipeline joins a
+// group's newsgroups list with commas so UploadDirectory can set the
+// NNTP Newsgroups: header once for crossposting, but the NZB spec wants
+// one <group> child per destination. Trims + drops empties so padded
+// input ("alt.a, alt.b") doesn't leak blanks into the output.
+func splitNNTPGroups(s string) []string {
+	out := make([]string, 0, 1)
+	for _, part := range strings.FieldsFunc(s, func(r rune) bool {
+		return r == ',' || r == ' ' || r == '\t' || r == '\n' || r == '\r'
+	}) {
+		part = strings.TrimSpace(part)
+		if part != "" {
+			out = append(out, part)
+		}
+	}
+	if len(out) == 0 {
+		// Preserve the prior behaviour of always having at least one group
+		// element in the NZB even if config is somehow empty — some
+		// downloaders reject NZBs with zero <group> children.
+		out = append(out, s)
+	}
+	return out
+}
 
 type NZB struct {
 	XMLName xml.Name  `xml:"nzb"`
@@ -82,6 +108,12 @@ func CreateMultiFileNZBBytes(cfg *config.Config, files []FileSegments, password 
 	now := time.Now().Unix()
 	totalFiles := len(files)
 
+	// cfg.NNTPGroup may be a comma-separated list for cross-posting (the
+	// offline pipeline joins a group's newsgroups into one string to
+	// leverage NNTP's crosspost header). In the NZB we want one <group>
+	// element per destination, not a single comma-containing one.
+	groupsList := splitNNTPGroups(cfg.NNTPGroup)
+
 	for i, f := range files {
 		// Standard subject format: [filenum/totalfiles] - "filename" yEnc (1/totalparts) filesize
 		subject := f.FileName
@@ -93,7 +125,7 @@ func CreateMultiFileNZBBytes(cfg *config.Config, files []FileSegments, password 
 			Poster:   cfg.NNTPPoster,
 			Date:     now,
 			Subject:  subject,
-			Groups:   []string{cfg.NNTPGroup},
+			Groups:   groupsList,
 			Segments: f.Segments,
 		})
 		_ = i // suppress unused
