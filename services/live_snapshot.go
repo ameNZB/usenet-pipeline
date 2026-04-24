@@ -24,6 +24,7 @@ type LiveSnapshot struct {
 	PublicIP       string    `json:"public_ip"`
 	DiskFreeGB     float64   `json:"disk_free_gb"`
 	DiskReservedGB float64   `json:"disk_reserved_gb"`
+	DiskTotalGB    float64   `json:"disk_total_gb"` // 0 on stub platforms; sidebar hides the bar when 0
 	UpdatedAt      time.Time `json:"updated_at"`
 }
 

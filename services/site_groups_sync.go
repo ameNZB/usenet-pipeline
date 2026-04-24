@@ -48,6 +48,14 @@ func StartSiteGroupsSync(ctx context.Context, site *client.SiteClient, db *stora
 		}
 		resp, err := site.FetchAgentGroups(since)
 		if err != nil {
+			// Maintenance mode returns a typed error; log it at a calmer
+			// level since we'll naturally retry on the next tick and
+			// there's nothing for the operator to do about it.
+			if me, ok := client.IsMaintenanceError(err); ok {
+				log.Printf("site-groups sync: site in maintenance (%s) — retrying in %s",
+					me.Info.Reason, siteGroupsPollInterval)
+				return
+			}
 			log.Printf("site-groups sync: fetch failed: %v", err)
 			return
 		}

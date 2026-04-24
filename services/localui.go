@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/ameNZB/usenet-pipeline/client"
 	"github.com/ameNZB/usenet-pipeline/config"
 	"github.com/ameNZB/usenet-pipeline/storage"
 )
@@ -35,7 +36,22 @@ type LocalUI struct {
 	db       *storage.DB
 	port     int
 	bindAddr string
+
+	// site is the authenticated client to the indexer site. Optional:
+	// the local UI works without it (groups, watch folders, local
+	// config), but the "Agent settings" panel's write path requires
+	// it to PUT /api/agent/web-config. Wired via SetSite after
+	// StartLocalUI returns because the site client is constructed in
+	// main.go alongside poll/status/complete and the LocalUI is
+	// created before them.
+	site *client.SiteClient
 }
+
+// SetSite wires the site client into the local UI. Called from main
+// after client.New so the /web-override form handler can write back
+// to the site. Concurrent writes are fine — the field is only read
+// from HTTP handler goroutines that start after StartLocalUI returns.
+func (u *LocalUI) SetSite(c *client.SiteClient) { u.site = c }
 
 func StartLocalUI(cfg *config.Config, secrets *SecretsStore, db *storage.DB) *LocalUI {
 	port, _ := strconv.Atoi(os.Getenv("LOCAL_UI_PORT"))
@@ -50,8 +66,21 @@ func StartLocalUI(cfg *config.Config, secrets *SecretsStore, db *storage.DB) *Lo
 	addr := net.JoinHostPort(bind, strconv.Itoa(port))
 
 	mux := http.NewServeMux()
+	// Shared assets — design tokens vendored from the site. Kept
+	// under /_shared/ to flag them visually as "same file as the
+	// site ships" and to reserve that prefix for future shared
+	// components (a component library, icons, etc).
+	mux.HandleFunc("/_shared/tokens.css", ServeTokensCSS)
+	mux.HandleFunc("/_shared/components.css", ServeComponentsCSS)
+	mux.HandleFunc("/_shared/agent-shell.css", ServeAgentShellCSS)
+	// Agent-only assets. Everything under /static/ is baked into
+	// the binary via go:embed and cached aggressively by the
+	// browser — see cssHandler in localui_assets.go.
+	mux.HandleFunc("/static/localui.css", ServeLocalUICSS)
+
 	mux.HandleFunc("/", ui.handleIndex)
 	mux.HandleFunc("/config", ui.handleConfig)
+	mux.HandleFunc("/config/web-override", ui.handleWebOverride)
 	mux.HandleFunc("/secrets", ui.handleSecrets)
 	mux.HandleFunc("/status", ui.handleStatus)
 	mux.HandleFunc("/groups", ui.handleGroups)
@@ -149,6 +178,53 @@ func (u *LocalUI) handleConfig(w http.ResponseWriter, r *http.Request) {
 	u.cfg.Refresh()
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "written": written})
+}
+
+// handleWebOverride writes (or clears) a single web-tier override on
+// the site via PUT /api/agent/web-config. The form posts three fields:
+// "key", "value" (empty to clear), and "return_to" (redirect target).
+// This is the agent's first "manage the site from the local UI" entry
+// point — everything else the site's admin dashboard does still lives
+// there, but the per-agent runtime knobs can now be tweaked without
+// alt-tabbing.
+func (u *LocalUI) handleWebOverride(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	if u.site == nil {
+		http.Error(w, "site client not configured", http.StatusServiceUnavailable)
+		return
+	}
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	key := strings.TrimSpace(r.PostForm.Get("key"))
+	value := strings.TrimSpace(r.PostForm.Get("value"))
+	returnTo := r.PostForm.Get("return_to")
+	if returnTo == "" {
+		returnTo = "/"
+	}
+	if key == "" {
+		redirectWithFlash(w, r, returnTo, "", "key is required")
+		return
+	}
+	if err := u.site.PutWebConfig(key, value); err != nil {
+		redirectWithFlash(w, r, returnTo, "", err.Error())
+		return
+	}
+	// Re-fetch the effective config from the site so the next render
+	// reflects what we just wrote (avoids a confusing lag where the
+	// form shows the old value until the next poll-driven refresh).
+	if rc, err := u.site.GetConfig(); err == nil && rc != nil {
+		u.cfg.Layered.ApplyWeb(rc.WebOverrides)
+	}
+	msg := "set " + key
+	if value == "" {
+		msg = "cleared " + key
+	}
+	redirectWithFlash(w, r, returnTo, msg, "")
 }
 
 func (u *LocalUI) handleSecrets(w http.ResponseWriter, r *http.Request) {
@@ -378,7 +454,7 @@ must be absolute.
 <p><button type="submit" class="primary">Add watch</button></p>
 </form>
 {{else}}
-<p style="color:var(--warn);">Create at least one <a href="/groups" style="color:var(--accent);">group</a> first, then come back to wire a folder to it.</p>
+<p style="color:var(--warn);">Create at least one <a href="/groups" style="color:var(--blue);">group</a> first, then come back to wire a folder to it.</p>
 {{end}}
 {{end}}
 `, watchesTmplFuncs)
@@ -395,19 +471,22 @@ deleting a row lets the watcher re-queue the same source file on next scan.
 
 {{if .Jobs}}
 <table>
+<thead>
 <tr><th>Title</th><th>Group</th><th>Status</th><th>Created</th><th>Error</th><th></th></tr>
+</thead>
+<tbody>
 {{range .Jobs}}
 <tr>
   <td>{{.Title}}<div class="small">{{.SourcePath}}</div></td>
   <td>{{.GroupNameAtCreation}}</td>
   <td><span class="badge {{statusClass .Status}}">{{.Status}}</span>{{if .Phase}} <span class="small">{{.Phase}}</span>{{end}}</td>
   <td class="small">{{.CreatedAt.Local.Format "Jan 02 15:04:05"}}</td>
-  <td style="color:var(--err);" class="small">{{.Error}}</td>
+  <td style="color:var(--red);" class="small">{{.Error}}</td>
   <td>
     {{if or (eq .Status "failed") (eq .Status "completed")}}
     <form class="row-form" method="post" action="/jobs/retry" style="display:inline;">
       <input type="hidden" name="id" value="{{.ID}}">
-      <button type="submit">Retry</button>
+      <button type="submit" class="primary">Retry</button>
     </form>
     {{end}}
     <form class="row-form" method="post" action="/jobs/delete" style="display:inline;" onsubmit="return confirm('Delete job for {{.Title}}?')">
@@ -417,6 +496,7 @@ deleting a row lets the watcher re-queue the same source file on next scan.
   </td>
 </tr>
 {{end}}
+</tbody>
 </table>
 {{else}}
 <p class="small">No jobs yet. Drop a file into a watch folder and give it a moment.</p>
@@ -447,6 +527,46 @@ persisted on this machine only; passkeys never leave the host.
 </table>
 <p><button type="submit" class="primary" {{if not .Writable}}disabled{{end}}>Save to config.yml</button>
 <span id="cs" class="small"></span></p>
+</form>
+
+<h2 style="margin-top:28px;">Site-side Overrides (web tier)</h2>
+<p class="small">
+Values the site has set for this agent. Edited here, written back to the site over the same
+channel the agent polls with — no need to log into the site's admin dashboard to tweak an
+override. Empty the value and save to clear an override.
+{{if not .SiteConnected}}<br><strong style="color:var(--warn);">Site client not configured — form disabled.</strong>{{end}}
+</p>
+<table>
+<tr><th>Key</th><th>Value</th><th></th></tr>
+{{range $k, $v := .WebOverrides}}
+<tr>
+  <td><code>{{$k}}</code></td>
+  <td>
+    <form class="row-form" method="post" action="/config/web-override">
+      <input type="hidden" name="key" value="{{$k}}">
+      <input type="hidden" name="return_to" value="/">
+      <input name="value" value="{{$v}}" size="30">
+      <button type="submit" class="primary" {{if not $.SiteConnected}}disabled{{end}}>Save</button>
+    </form>
+  </td>
+  <td>
+    <form class="row-form" method="post" action="/config/web-override" style="display:inline;">
+      <input type="hidden" name="key" value="{{$k}}">
+      <input type="hidden" name="value" value="">
+      <input type="hidden" name="return_to" value="/">
+      <button type="submit" class="danger" {{if not $.SiteConnected}}disabled{{end}}>Clear</button>
+    </form>
+  </td>
+</tr>
+{{else}}
+<tr><td colspan="3" class="small">No site-side overrides set.</td></tr>
+{{end}}
+</table>
+<form method="post" action="/config/web-override" style="margin-top:12px;">
+  <input type="hidden" name="return_to" value="/">
+  <input name="key" placeholder="max_concurrent_downloads" required size="30">
+  <input name="value" placeholder="new value" size="20">
+  <button type="submit" class="primary" {{if not .SiteConnected}}disabled{{end}}>Add override</button>
 </form>
 
 <h2 style="margin-top:28px;">Private Trackers (secrets.yml, 0600)</h2>
@@ -502,10 +622,12 @@ func (u *LocalUI) handleIndex(w http.ResponseWriter, r *http.Request) {
 	for _, k := range config.ConfigYmlKeys {
 		rows = append(rows, row{Key: k, Value: u.cfg.Layered.Effective(k), Source: sourceFor(u.cfg.Layered, k)})
 	}
-	data := u.baseData("config", "", "")
+	data := u.baseData("config", r.URL.Query().Get("msg"), r.URL.Query().Get("err"))
 	data["Writable"] = u.cfg.Layered.Writable()
 	data["Rows"] = rows
 	data["SecretsHosts"] = u.secrets.List()
+	data["WebOverrides"] = u.cfg.Layered.WebSnapshot()
+	data["SiteConnected"] = u.site != nil
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	_ = localUITmpl.Execute(w, data)
 }
@@ -890,6 +1012,7 @@ func (u *LocalUI) handleEvents(w http.ResponseWriter, r *http.Request) {
 			"public_ip":        snap.PublicIP,
 			"disk_free_gb":     snap.DiskFreeGB,
 			"disk_reserved_gb": snap.DiskReservedGB,
+			"disk_total_gb":    snap.DiskTotalGB,
 		}
 		if u.db != nil {
 			// Job counts per status — drive sidebar badges and also catches

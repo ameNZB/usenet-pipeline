@@ -206,6 +206,34 @@ func (c *SiteClient) Poll() (*PollResult, error) {
 	return &PollResult{Task: &task}, nil
 }
 
+// FetchCachedTorrentByInfoHash asks the site for a server-pre-fetched
+// .torrent blob keyed by info_hash. Returns (nil, nil) on a 404 (no
+// cache entry yet — the caller falls back to its own DHT lookup), or
+// (nil, err) on a real failure (network, auth, parse). The site's
+// metadata-prefetch worker populates these in the background; using
+// the cache lets us skip the 2-minute DHT round-trip when it's there.
+func (c *SiteClient) FetchCachedTorrentByInfoHash(infoHash string) ([]byte, error) {
+	url := fmt.Sprintf("%s/api/agent/cached-torrent/%s", c.baseURL, infoHash)
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+c.token)
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, nil
+	}
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("cached-torrent fetch returned %d: %s", resp.StatusCode, body)
+	}
+	return io.ReadAll(io.LimitReader(resp.Body, 10<<20))
+}
+
 // FetchTorrentFile downloads a .torrent file from the site. urlPath is the
 // path returned in AgentTask.TorrentFileURL (e.g. "/api/agent/torrent/42").
 // Absolute URLs are also accepted, in case the site ever starts returning
@@ -272,6 +300,35 @@ func (c *SiteClient) PostLocalConfig(report config.SettingsReport) error {
 	return nil
 }
 
+// PutWebConfig writes (or clears) a single web-tier override on the site,
+// as this agent. Empty value means "clear the override" — matches the
+// wire contract of PUT /api/agent/web-config on the site side.
+//
+// Used by the local UI's "Agent settings" form to let the operator
+// manage site-side config without logging into the site. The agent's
+// next poll picks up the new WebOverrides and re-applies them through
+// config.Layered.ApplyWeb so the change takes effect without a
+// restart.
+func (c *SiteClient) PutWebConfig(key, value string) error {
+	body, _ := json.Marshal(map[string]string{"key": key, "value": value})
+	req, err := http.NewRequest("PUT", c.baseURL+"/api/agent/web-config", bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+c.token)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("web-config write returned %d: %s", resp.StatusCode, body)
+	}
+	return nil
+}
+
 // SiteAgentGroup mirrors the site's AgentGroup model. Decoded verbatim
 // from GET /api/agent/groups; the caller converts it into the local
 // storage.Group shape (source='site') before upserting into SQLite.
@@ -321,6 +378,18 @@ func (c *SiteClient) FetchAgentGroups(sinceVersion int) (*AgentGroupsResponse, e
 	if resp.StatusCode == http.StatusNotFound {
 		// Site hasn't been upgraded — treat as "no groups yet".
 		return &AgentGroupsResponse{Groups: []SiteAgentGroup{}}, nil
+	}
+	// 503 with a maintenance body is the site telling all agents to back
+	// off during a vacuum / migration. Surface it as a typed error so the
+	// caller can downgrade it from "error" to "info" in logs (sync is
+	// optional and we're going to retry on the next tick anyway).
+	if resp.StatusCode == http.StatusServiceUnavailable {
+		body, _ := io.ReadAll(resp.Body)
+		var m MaintenanceResponse
+		if json.Unmarshal(body, &m) == nil && m.Maintenance {
+			return nil, &MaintenanceError{Info: m}
+		}
+		return nil, fmt.Errorf("agent groups returned 503: %s", body)
 	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("agent groups returned %d", resp.StatusCode)
@@ -451,11 +520,20 @@ func (c *SiteClient) ClearMyLocks() (int, error) {
 }
 
 // ReportProgress sends a progress update to the site.
-func (c *SiteClient) ReportProgress(lockID int, progress, speed string) error {
+func (c *SiteClient) ReportProgress(lockID int, progress, speed string, warnings []LockWarning) error {
+	// warnings is serialized as its own JSON-encoded string field so the
+	// site can store it verbatim in the JSONB column without re-marshal.
+	warnJSON := "[]"
+	if len(warnings) > 0 {
+		if b, err := json.Marshal(warnings); err == nil {
+			warnJSON = string(b)
+		}
+	}
 	body, _ := json.Marshal(map[string]interface{}{
 		"lock_id":  lockID,
 		"progress": progress,
 		"speed":    speed,
+		"warnings": warnJSON,
 	})
 	req, err := http.NewRequest("POST", c.baseURL+"/api/agent/progress", bytes.NewReader(body))
 	if err != nil {
@@ -488,14 +566,26 @@ type AgentLiveStatus struct {
 
 // FileProgress tracks per-file download/upload progress.
 type FileProgress struct {
-	Name        string  `json:"name"`
-	Size        int64   `json:"size"`
-	Transferred int64   `json:"transferred"`
-	Percent     float64 `json:"percent"`
-	Speed       string  `json:"speed,omitempty"`
-	UpSpeed     string  `json:"up_speed,omitempty"`
-	Phase       string  `json:"phase"`
-	Peers       int     `json:"peers,omitempty"`
+	Name        string         `json:"name"`
+	Size        int64          `json:"size"`
+	Transferred int64          `json:"transferred"`
+	Percent     float64        `json:"percent"`
+	Speed       string         `json:"speed,omitempty"`
+	UpSpeed     string         `json:"up_speed,omitempty"`
+	Phase       string         `json:"phase"`
+	Peers       int            `json:"peers,omitempty"`
+	Warnings    []LockWarning  `json:"warnings,omitempty"`
+}
+
+// LockWarning mirrors the site's models.LockWarning. The agent emits
+// one of these per currently-counting skip rule (slow speed, low
+// peers, stalled) so the dashboard can surface an icon with a live
+// countdown before the rule fires.
+type LockWarning struct {
+	Kind      string    `json:"kind"`
+	Label     string    `json:"label"`
+	Icon      string    `json:"icon"`
+	ExpiresAt time.Time `json:"expires_at"`
 }
 
 // PostStatus sends the agent's live status to the site for dashboard display.
@@ -533,6 +623,12 @@ type CompleteResult struct {
 	Password    string
 	MediaInfo   interface{} // *services.VideoInfo — JSON-serialized
 	Screenshots []string    // file paths to screenshot JPEGs
+	// TotalSizeBytes is the torrent's discovered TotalLength from
+	// metainfo. Reported on successful completion AND on oversize-abort so
+	// the site can record it on nzb_requests.size_bytes — future poll
+	// queries skip the same torrent for any agent whose free disk is
+	// smaller. Zero means "unknown" and is omitted from the form.
+	TotalSizeBytes int64
 }
 
 // maxUploadSize is the threshold (uncompressed) above which screenshots are
@@ -629,6 +725,9 @@ func (c *SiteClient) buildCompleteForm(result CompleteResult, screenshots []scre
 	}
 	if result.Password != "" {
 		w.WriteField("password", result.Password)
+	}
+	if result.TotalSizeBytes > 0 {
+		w.WriteField("total_size_bytes", fmt.Sprintf("%d", result.TotalSizeBytes))
 	}
 
 	if result.NzbData != nil {

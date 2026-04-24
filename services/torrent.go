@@ -28,6 +28,25 @@ import (
 // shouldn't pause the whole queue when smaller ones could still succeed.
 var ErrInsufficientDisk = errors.New("insufficient disk space")
 
+// DiskShortfallError wraps ErrInsufficientDisk with the discovered torrent
+// size so the abort path can report it back to the site. Once the site
+// stores size_bytes on the request, the poll dispatcher will filter this
+// torrent out for every agent (and every future poll from this one) with
+// equal-or-less free disk, eliminating the repeat metadata-fetch cost for
+// the oversize backlog. errors.Is(err, ErrInsufficientDisk) keeps working
+// via Unwrap; errors.As gives access to the fields.
+type DiskShortfallError struct {
+	TorrentBytes    int64 // total_length the agent just learned
+	AvailableBytes  int64 // what we had free after reservations
+}
+
+func (e *DiskShortfallError) Error() string {
+	return fmt.Sprintf("insufficient disk space: torrent is %.1f GB, have %.1f GB free",
+		float64(e.TorrentBytes)/1e9, float64(e.AvailableBytes)/1e9)
+}
+
+func (e *DiskShortfallError) Unwrap() error { return ErrInsufficientDisk }
+
 // layeredInt pulls a whole-number setting from the layered config; returns
 // the fallback when the key is unset or not parseable.
 func layeredInt(cfg *config.Config, key string, fallback int) int {
@@ -155,6 +174,25 @@ func DownloadPrivateTorrentBytes(ctx context.Context, torrentBytes []byte, cfg *
 	}
 	defer os.Remove(tempPath)
 	return downloadTorrentFile(ctx, tempPath, cfg, jobName, true)
+}
+
+// DownloadCachedTorrentBytes is the public-torrent equivalent of
+// DownloadPrivateTorrentBytes. Used when the site's metadata-prefetch
+// worker has already resolved the .torrent for a public request, so
+// the agent can skip its own 2-minute DHT round-trip. DHT stays on
+// (peers come from DHT + the trackers baked into the .torrent), and
+// no public-tracker injection happens — those trackers are already in
+// the file.
+func DownloadCachedTorrentBytes(ctx context.Context, torrentBytes []byte, cfg *config.Config, jobName string, opts *DownloadOpts) (string, error) {
+	tempPath := filepath.Join(cfg.TempDir, "dl-"+jobName+".torrent")
+	if err := os.MkdirAll(filepath.Dir(tempPath), 0755); err != nil {
+		return "", fmt.Errorf("create temp dir: %w", err)
+	}
+	if err := os.WriteFile(tempPath, torrentBytes, 0644); err != nil {
+		return "", fmt.Errorf("stage .torrent file: %w", err)
+	}
+	defer os.Remove(tempPath)
+	return downloadTorrentFile(ctx, tempPath, cfg, jobName, false)
 }
 
 // DownloadTorrent handles adding a torrent file and downloading its contents.
@@ -293,11 +331,10 @@ func downloadMagnet(ctx context.Context, magnetURI string, cfg *config.Config, j
 		log.Printf("Warning: could not check disk space: %v", err)
 	} else if effective < uint64(requiredBytes) {
 		t.Drop()
-		return "", fmt.Errorf("%w: need %.1f GB (%.1fx %.1f GB torrent), have %.1f GB effective free",
-			ErrInsufficientDisk,
-			float64(requiredBytes)/1e9, DiskMultiplier,
-			float64(torrentSize)/1e9,
-			float64(effective)/1e9)
+		return "", &DiskShortfallError{
+			TorrentBytes:   torrentSize,
+			AvailableBytes: int64(effective),
+		}
 	} else {
 		log.Printf("Disk space OK: %.1f GB effective free, reserving %.1f GB",
 			float64(effective)/1e9, float64(requiredBytes)/1e9)
@@ -364,7 +401,12 @@ func runSeedPhase(ctx context.Context, t *torrent.Torrent, jobName string, so se
 				if pct > 100 {
 					pct = 100
 				}
-				cb(dnSpeed, upSpeed, pct, "seeding", peers)
+				// Total/transferred during seeding: keep the original
+				// torrent size as "total" and bytes-uploaded so far as
+				// "transferred" so the dashboard can show "uploaded
+				// X / Y" instead of a bare ratio. ETA is ratio- or
+				// time-bounded, not byte-bounded, so leave it as 0.
+				cb(dnSpeed, upSpeed, pct, "seeding", peers, t.Length(), uploaded, 0, nil)
 			}
 			storage.UpdateState(jobName, "Seeding",
 				fmt.Sprintf("ratio %.3f / %.2f - %.2f MB/s up - %d peers", ratio, so.RatioTarget, upSpeed, peers),
@@ -382,11 +424,27 @@ func runSeedPhase(ctx context.Context, t *torrent.Torrent, jobName string, so se
 	}
 }
 
-// ProgressCallback is called periodically with download and upload speeds
-// (MB/s), percent (0-100), phase, and peer count. downMBs is the payload
-// receive rate; upMBs is the payload send rate (peer uploads during a torrent
-// phase, or NNTP upload rate during the usenet phase).
-type ProgressCallback func(downMBs float64, upMBs float64, percent float64, phase string, peers int)
+// ProgressWarning is one rule-violation countdown surfaced to the site
+// so the admin / owner dashboards can render a live "will skip in X"
+// indicator. ExpiresAt is absolute (now + remaining timeout), so the
+// browser ticks it down without extra polling.
+type ProgressWarning struct {
+	Kind      string    // slow_speed | low_peers | stalled
+	Label     string    // hover description
+	Icon      string    // emoji shown next to the timer
+	ExpiresAt time.Time // when the rule will trigger a skip
+}
+
+// ProgressCallback is called periodically with the running stats for a
+// task. downMBs is the payload receive rate, upMBs is the payload send
+// rate (peer uploads in a torrent phase, NNTP upload rate in the usenet
+// phase). totalBytes / transferredBytes are the absolute counters so
+// the dashboard can render "X / Y MB" without re-deriving from percent
+// (which loses precision and bottoms out at 100). etaSeconds is the
+// remaining time at the current speed; 0 means unknown / not applicable.
+// warnings is the current active-rule countdown set; empty means the
+// task is healthy.
+type ProgressCallback func(downMBs float64, upMBs float64, percent float64, phase string, peers int, totalBytes int64, transferredBytes int64, etaSeconds float64, warnings []ProgressWarning)
 
 // ErrSlowDownload is returned when a download is rejected for being too slow.
 var ErrSlowDownload = fmt.Errorf("download rejected: speed too low for too long")
@@ -436,6 +494,12 @@ func downloadAndWaitSeed(ctx context.Context, cl *torrent.Client, t *torrent.Tor
 	var lowPeersSince time.Time
 	lowPeersTimeout := time.Duration(0)
 	lowPeersThreshold := -1 // -1 = disabled
+
+	// Hysteresis: require N consecutive good ticks before clearing a
+	// rule's "since" timer. Without this the dashboard warning
+	// flickers as speed/peers bounce around the threshold every tick.
+	const recoveryTicksRequired = 3
+	var slowRecovery, stallRecovery, lowPeersRecovery int
 	if opts != nil {
 		slowThreshold = opts.SlowThresholdMBs
 		if opts.SlowTimeoutMins > 0 {
@@ -456,7 +520,7 @@ func downloadAndWaitSeed(ctx context.Context, cl *torrent.Client, t *torrent.Tor
 		case <-done:
 			storage.UpdateState(jobName, "Downloading", "100% (Download Complete)", 100)
 			if cb := GetProgressCallback(jobName); cb != nil {
-				cb(0, 0, 100, "downloading", 0)
+				cb(0, 0, 100, "downloading", 0, t.Length(), t.Length(), 0, nil)
 			}
 			// Enter the optional seeding phase. UploadKBps == 0 keeps the
 			// pre-existing behaviour of dropping the torrent immediately.
@@ -474,20 +538,17 @@ func downloadAndWaitSeed(ctx context.Context, cl *torrent.Client, t *torrent.Tor
 				speed := float64(completed-lastCompleted) / 1024 / 1024
 				upSpeed := float64(uploaded-lastUploaded) / 1024 / 1024
 
+				var etaSeconds float64
 				etaStr := "Calculating..."
 				if speed > 0 {
 					remainingMB := float64(total-completed) / 1024 / 1024
-					etaSeconds := remainingMB / speed
+					etaSeconds = remainingMB / speed
 					etaStr = utils.FormatETA(etaSeconds)
 				}
 
 				lastCompleted = completed
 				lastUploaded = uploaded
 				storage.UpdateState(jobName, "Downloading", fmt.Sprintf("%.1f%% (%.2f / %.2f MB) - %.2f MB/s dn / %.2f MB/s up - ETA: %s - %d peers", percent, float64(completed)/1024/1024, float64(total)/1024/1024, speed, upSpeed, etaStr, peers), percent)
-
-				if cb := GetProgressCallback(jobName); cb != nil {
-					cb(speed, upSpeed, percent, "downloading", peers)
-				}
 
 				// Periodic log so stdout isn't silent during long downloads.
 				if time.Since(lastLog) >= 30*time.Second {
@@ -499,6 +560,7 @@ func downloadAndWaitSeed(ctx context.Context, cl *torrent.Client, t *torrent.Tor
 				}
 
 				// Slow download detection — skip the first 30s to allow ramp-up.
+				slowActive := false
 				if slowTimeout > 0 && slowThreshold > 0 && percent < 95 {
 					isSlow := speed < slowThreshold
 					// Boosted requests are only rejected if speed is truly zero.
@@ -507,6 +569,7 @@ func downloadAndWaitSeed(ctx context.Context, cl *torrent.Client, t *torrent.Tor
 					}
 
 					if isSlow {
+						slowRecovery = 0
 						if slowSince.IsZero() {
 							slowSince = time.Now()
 						} else if time.Since(slowSince) > slowTimeout {
@@ -515,8 +578,18 @@ func downloadAndWaitSeed(ctx context.Context, cl *torrent.Client, t *torrent.Tor
 							t.Drop()
 							return filepath.Join(dataDir, t.Name()), ErrSlowDownload
 						}
-					} else {
-						slowSince = time.Time{} // reset timer when speed recovers
+						slowActive = true
+					} else if !slowSince.IsZero() {
+						// Hysteresis: only clear the timer after several
+						// consecutive good ticks so the dashboard
+						// countdown doesn't flicker on threshold edges.
+						slowRecovery++
+						if slowRecovery >= recoveryTicksRequired {
+							slowSince = time.Time{}
+							slowRecovery = 0
+						} else {
+							slowActive = true
+						}
 					}
 				}
 
@@ -532,8 +605,10 @@ func downloadAndWaitSeed(ctx context.Context, cl *torrent.Client, t *torrent.Tor
 				// No percent gate: a torrent stuck at 99.x% with 0 peers
 				// never finishes — the earlier `percent < 99` cap let those
 				// hold a slot forever. StallMins itself is the knob.
+				stallActive := false
 				if so.StallMins > 0 {
 					if speed == 0 {
+						stallRecovery = 0
 						if stallSince.IsZero() {
 							stallSince = time.Now()
 						} else if time.Since(stallSince) > time.Duration(so.StallMins)*time.Minute {
@@ -541,14 +616,23 @@ func downloadAndWaitSeed(ctx context.Context, cl *torrent.Client, t *torrent.Tor
 							t.Drop()
 							return filepath.Join(dataDir, t.Name()), ErrSlowDownload
 						}
-					} else {
-						stallSince = time.Time{}
+						stallActive = true
+					} else if !stallSince.IsZero() {
+						stallRecovery++
+						if stallRecovery >= recoveryTicksRequired {
+							stallSince = time.Time{}
+							stallRecovery = 0
+						} else {
+							stallActive = true
+						}
 					}
 				}
 
 				// Low peer detection — skip if seeds stay at or below threshold.
+				lowPeersActive := false
 				if lowPeersTimeout > 0 && lowPeersThreshold >= 0 && percent < 95 {
 					if peers <= lowPeersThreshold {
+						lowPeersRecovery = 0
 						if lowPeersSince.IsZero() {
 							lowPeersSince = time.Now()
 						} else if time.Since(lowPeersSince) > lowPeersTimeout {
@@ -557,9 +641,49 @@ func downloadAndWaitSeed(ctx context.Context, cl *torrent.Client, t *torrent.Tor
 							t.Drop()
 							return filepath.Join(dataDir, t.Name()), ErrSlowDownload
 						}
-					} else {
-						lowPeersSince = time.Time{}
+						lowPeersActive = true
+					} else if !lowPeersSince.IsZero() {
+						lowPeersRecovery++
+						if lowPeersRecovery >= recoveryTicksRequired {
+							lowPeersSince = time.Time{}
+							lowPeersRecovery = 0
+						} else {
+							lowPeersActive = true
+						}
 					}
+				}
+
+				// Build the live warnings list from whichever rules are
+				// currently counting down. ExpiresAt is absolute so the
+				// browser can tick the countdown without re-polling.
+				var warnings []ProgressWarning
+				if slowActive && !slowSince.IsZero() {
+					warnings = append(warnings, ProgressWarning{
+						Kind:      "slow_speed",
+						Label:     fmt.Sprintf("Speed below %.2f MB/s — will skip", slowThreshold),
+						Icon:      "🐢",
+						ExpiresAt: slowSince.Add(slowTimeout),
+					})
+				}
+				if stallActive && !stallSince.IsZero() {
+					warnings = append(warnings, ProgressWarning{
+						Kind:      "stalled",
+						Label:     "Download stalled at 0 MB/s — will skip",
+						Icon:      "⏸",
+						ExpiresAt: stallSince.Add(time.Duration(so.StallMins) * time.Minute),
+					})
+				}
+				if lowPeersActive && !lowPeersSince.IsZero() {
+					warnings = append(warnings, ProgressWarning{
+						Kind:      "low_peers",
+						Label:     fmt.Sprintf("Peers ≤ %d — will skip", lowPeersThreshold),
+						Icon:      "👥",
+						ExpiresAt: lowPeersSince.Add(lowPeersTimeout),
+					})
+				}
+
+				if cb := GetProgressCallback(jobName); cb != nil {
+					cb(speed, upSpeed, percent, "downloading", peers, total, completed, etaSeconds, warnings)
 				}
 			}
 		}

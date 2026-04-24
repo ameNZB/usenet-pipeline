@@ -193,6 +193,20 @@ type LocalValue struct {
 	Source string `json:"source"` // "yml" or "env"
 }
 
+// WebSnapshot returns a copy of the current web-tier overrides — the
+// key/value map the site applied via the last GetConfig poll. Used by
+// the local UI to render which overrides are in effect so the operator
+// can see/clear them without opening the site's admin dashboard.
+func (l *Layered) WebSnapshot() map[string]string {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	out := make(map[string]string, len(l.web))
+	for k, v := range l.web {
+		out[k] = v
+	}
+	return out
+}
+
 // ApplyWeb replaces the web-override tier. An empty map clears all overrides
 // (used when the site processes "reset web settings").
 func (l *Layered) ApplyWeb(m map[string]string) {

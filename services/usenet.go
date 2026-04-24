@@ -237,6 +237,7 @@ func UploadToUsenet(ctx context.Context, cfg *config.Config, filePath string, su
 			speed = float64(uploadedBytes) / elapsed / 1024 / 1024
 		}
 
+		var etaSeconds float64
 		etaStr := "Calculating..."
 		if speed > 0 {
 			var remainingMB float64
@@ -245,14 +246,22 @@ func UploadToUsenet(ctx context.Context, cfg *config.Config, filePath string, su
 			} else {
 				remainingMB = (float64(totalChunks*ChunkSize) - float64(uploadedBytes)) / 1024 / 1024
 			}
-			etaSeconds := remainingMB / speed
+			etaSeconds = remainingMB / speed
 			etaStr = utils.FormatETA(etaSeconds)
 		}
 
 		storage.UpdateState(jobName, "Uploading", fmt.Sprintf("%.1f%% - %.2f MB/s - ETA: %s", overallPercent, speed, etaStr), overallPercent)
 
 		if cb := GetProgressCallback(jobName); cb != nil {
-			cb(0, speed, overallPercent, "uploading", 0)
+			// Total = totalDirSize when known; transferred = cumulative
+			// across already-finished files + bytes pushed this iter.
+			var total int64
+			if totalDirSize > 0 {
+				total = totalDirSize
+			} else {
+				total = int64(totalChunks) * int64(ChunkSize)
+			}
+			cb(0, speed, overallPercent, "uploading", 0, total, cumulativeBytes+uploadedBytes, etaSeconds, nil)
 		}
 	}
 

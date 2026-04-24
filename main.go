@@ -17,6 +17,7 @@ import (
 	"github.com/ameNZB/usenet-pipeline/config"
 	"github.com/ameNZB/usenet-pipeline/services"
 	"github.com/ameNZB/usenet-pipeline/storage"
+	"github.com/ameNZB/usenet-pipeline/utils"
 )
 
 // ── Live status: aggregated across all concurrent tasks ─────────────────────
@@ -235,14 +236,21 @@ func aggregateLiveStatus() (dlMBps, ulMBps float64) {
 	downloading, uploading := 0, 0
 	for _, fp := range taskProgress {
 		files = append(files, *fp)
-		// Parse speed from the formatted string.
-		var spd float64
-		fmt.Sscanf(fp.Speed, "%f", &spd)
+		// FileProgress has separate Speed (download) and UpSpeed (upload)
+		// fields — a torrent in "downloading" phase can also be seeding
+		// pieces back, and an "uploading" file's throughput lives in
+		// UpSpeed (Speed is download-only). Sum both unconditionally so
+		// the aggregate honestly reflects what the network is doing,
+		// regardless of phase. Phase counters are still used below to
+		// pick the displayed status badge ("uploading" / "downloading").
+		var ds, us float64
+		fmt.Sscanf(fp.Speed, "%f", &ds)
+		fmt.Sscanf(fp.UpSpeed, "%f", &us)
+		dlSpeed += ds
+		ulSpeed += us
 		if fp.Phase == "downloading" {
-			dlSpeed += spd
 			downloading++
 		} else if fp.Phase == "uploading" {
-			ulSpeed += spd
 			uploading++
 		}
 	}
@@ -298,6 +306,10 @@ func startStatusReporter(site *client.SiteClient, tempDir string) {
 			snap.DiskFreeGB = float64(free) / 1024 / 1024 / 1024
 		}
 		snap.DiskReservedGB = float64(services.TotalReservedBytes()) / 1024 / 1024 / 1024
+		var diskTotalGB float64
+		if total, err := services.TotalDiskSpace(tempDir); err == nil && total > 0 {
+			diskTotalGB = float64(total) / 1024 / 1024 / 1024
+		}
 
 		// Publish the local-UI snapshot (typed floats, minimal fields) for
 		// the SSE endpoint. Separate from the site post so a site outage
@@ -311,6 +323,7 @@ func startStatusReporter(site *client.SiteClient, tempDir string) {
 			PublicIP:       snap.PublicIP,
 			DiskFreeGB:     snap.DiskFreeGB,
 			DiskReservedGB: snap.DiskReservedGB,
+			DiskTotalGB:    diskTotalGB,
 		})
 
 		resp, err := site.PostStatus(snap)
@@ -558,11 +571,15 @@ func main() {
 	go services.MonitorNetworkConnection(cfg)
 
 	// Secrets + optional local UI. Both are no-ops when the operator hasn't
-	// enabled them (LOCAL_UI_PORT unset, secrets.yml missing).
+	// enabled them (LOCAL_UI_PORT unset, secrets.yml missing). The local UI
+	// needs the site client so its "Agent settings" panel can PUT web-tier
+	// overrides — see services.LocalUI.SetSite.
 	secrets := services.LoadSecrets()
-	localUI := services.StartLocalUI(cfg, secrets, db)
-
 	site := client.New(cfg)
+	localUI := services.StartLocalUI(cfg, secrets, db)
+	if localUI != nil {
+		localUI.SetSite(site)
+	}
 	pollInterval := time.Duration(cfg.PollInterval) * time.Second
 
 	// On startup, clear any stale locks from a previous crash.
@@ -848,7 +865,7 @@ func processTask(cfg *config.Config, site *client.SiteClient, task *client.Agent
 
 	reportProgress := func(phase, details string) {
 		storage.UpdateState(jobName, phase, details, 0)
-		_ = site.ReportProgress(task.LockID, phase+": "+details, "")
+		_ = site.ReportProgress(task.LockID, phase+": "+details, "", nil)
 	}
 
 	fail := func(phase, msg string, err error) {
@@ -861,11 +878,22 @@ func processTask(cfg *config.Config, site *client.SiteClient, task *client.Agent
 		// don't re-fetch its metadata if the site hands it right back.
 		if errors.Is(err, services.ErrInsufficientDisk) || isRuntimeDiskFullError(err) {
 			reportProgress("Aborted", reason)
+			// If it was our pre-flight that fired (the typed variant),
+			// pass the discovered torrent size to the site so future
+			// polls from smaller-disk agents skip this request without
+			// spending 2 minutes re-resolving metadata. OS-level ENOSPC
+			// doesn't carry a size, so in that branch we stay silent.
+			var total int64
+			var ds *services.DiskShortfallError
+			if errors.As(err, &ds) {
+				total = ds.TorrentBytes
+			}
 			_ = site.Complete(client.CompleteResult{
-				LockID:     task.LockID,
-				RequestID:  task.RequestID,
-				Status:     "aborted",
-				FailReason: reason,
+				LockID:         task.LockID,
+				RequestID:      task.RequestID,
+				Status:         "aborted",
+				FailReason:     reason,
+				TotalSizeBytes: total,
 			})
 			markOversize(task.RequestID)
 			return
@@ -896,7 +924,7 @@ func processTask(cfg *config.Config, site *client.SiteClient, task *client.Agent
 
 	// Per-task progress callback for live dashboard.
 	var lastLockUpdate time.Time
-	progressCb := func(downMBs float64, upMBs float64, percent float64, phase string, peers int) {
+	progressCb := func(downMBs float64, upMBs float64, percent float64, phase string, peers int, totalBytes int64, transferredBytes int64, etaSeconds float64, warnings []services.ProgressWarning) {
 		// The "headline" speed for a single-string display is the dominant
 		// direction for the phase: upload speed during seeding/uploading,
 		// download speed otherwise.
@@ -904,20 +932,40 @@ func processTask(cfg *config.Config, site *client.SiteClient, task *client.Agent
 		if phase == "seeding" || phase == "uploading" {
 			headline = upMBs
 		}
+		// Translate the service-layer warning shape into the client/site
+		// shape (same fields, decouples the two packages).
+		var clientWarnings []client.LockWarning
+		for _, w := range warnings {
+			clientWarnings = append(clientWarnings, client.LockWarning{
+				Kind:      w.Kind,
+				Label:     w.Label,
+				Icon:      w.Icon,
+				ExpiresAt: w.ExpiresAt,
+			})
+		}
 		fp := &client.FileProgress{
-			Name:    task.Title,
-			Percent: percent,
-			Speed:   fmt.Sprintf("%.2f MB/s", downMBs),
-			Phase:   phase,
-			Peers:   peers,
+			Name:        task.Title,
+			Size:        totalBytes,
+			Transferred: transferredBytes,
+			Percent:     percent,
+			Speed:       fmt.Sprintf("%.2f MB/s", downMBs),
+			Phase:       phase,
+			Peers:       peers,
+			Warnings:    clientWarnings,
 		}
 		if upMBs > 0 || phase == "seeding" || phase == "uploading" {
 			fp.UpSpeed = fmt.Sprintf("%.2f MB/s", upMBs)
 		}
 		updateTaskProgress(task.RequestID, fp)
 		// Throttle DB lock updates to every 10 seconds so the admin Active
-		// Tasks table stays current without hammering the site API.
-		if time.Since(lastLockUpdate) >= 10*time.Second {
+		// Tasks table stays current without hammering the site API. When
+		// warnings are active we always push (so the countdown doesn't go
+		// stale up to 10s late) but cap that to once per second.
+		shouldPush := time.Since(lastLockUpdate) >= 10*time.Second
+		if !shouldPush && len(clientWarnings) > 0 && time.Since(lastLockUpdate) >= 1*time.Second {
+			shouldPush = true
+		}
+		if shouldPush {
 			lastLockUpdate = time.Now()
 			label := "Downloading"
 			if phase == "uploading" {
@@ -929,7 +977,10 @@ func processTask(cfg *config.Config, site *client.SiteClient, task *client.Agent
 			if peers > 0 {
 				progress += fmt.Sprintf(" [%d peers]", peers)
 			}
-			_ = site.ReportProgress(task.LockID, progress, fmt.Sprintf("%.1f MB/s", headline))
+			if etaSeconds > 0 {
+				progress += " - ETA " + utils.FormatETA(etaSeconds)
+			}
+			_ = site.ReportProgress(task.LockID, progress, fmt.Sprintf("%.1f MB/s", headline), clientWarnings)
 		}
 	}
 
@@ -990,7 +1041,25 @@ func processTask(cfg *config.Config, site *client.SiteClient, task *client.Agent
 				downloadedPath, err = services.DownloadPrivateTorrentBytes(ctx, blob, cfg, jobName, dlOpts)
 			}
 		} else {
-			downloadedPath, err = services.DownloadMagnet(ctx, magnet, cfg, jobName, dlOpts)
+			// Public torrent: try the site's metadata cache first so we
+			// can skip the 2-minute DHT round-trip when the prefetch
+			// worker has already resolved this hash. Cache miss (404 →
+			// nil, nil) silently falls through to DownloadMagnet, so
+			// older sites without the cache endpoint still work.
+			var cached []byte
+			if task.InfoHash != "" {
+				if c, cerr := site.FetchCachedTorrentByInfoHash(task.InfoHash); cerr == nil {
+					cached = c
+				}
+				// A real fetch error (not 404) is logged but doesn't
+				// abort — DHT fallback below still has a shot.
+			}
+			if len(cached) > 0 {
+				log.Printf("[%d] Cache hit (%d bytes) — skipping DHT", task.RequestID, len(cached))
+				downloadedPath, err = services.DownloadCachedTorrentBytes(ctx, cached, cfg, jobName, dlOpts)
+			} else {
+				downloadedPath, err = services.DownloadMagnet(ctx, magnet, cfg, jobName, dlOpts)
+			}
 		}
 
 		services.ClearProgressCallbackForJob(jobName)

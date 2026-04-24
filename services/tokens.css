@@ -1,0 +1,32 @@
+/* Canonical design tokens — the shared palette and typography used by
+   both the site (via theme.css) and the indexer-agent's local UI
+   (vendored at indexer-agent/services/tokens.css and served through
+   //go:embed). Keep the two copies byte-identical; the agent doesn't
+   share a filesystem with the site so we literally copy on change.
+   This is also why this file has no @layer or :where() wrapping — any
+   feature we use has to survive being served by a separate binary. */
+
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=Ubuntu:wght@400;500;700&display=swap');
+
+:root {
+  /* Surfaces */
+  --bg-base:      #0f1115;
+  --bg-surface:   #16181e;
+  --bg-elevated:  #1c1f27;
+  --bg-hover:     #22252e;
+  --border:       #2a2d37;
+
+  /* Text */
+  --text-primary: #e2e4ec;
+  --text-muted:   #6b7485;
+
+  /* Accents */
+  --blue:         #5b8af5;
+  --blue-hover:   #4070e0;
+  --blue-dim:     #1e2a4a;
+
+  /* Status */
+  --green:        #22c55e;
+  --red:          #ef4444;
+  --warn:         #f59e0b;
+}

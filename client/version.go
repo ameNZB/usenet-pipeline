@@ -23,4 +23,8 @@ const AgentProtocolVersion = 2
 // this agent polls. Not used for compatibility gating — that's
 // AgentProtocolVersion's job — but useful for debugging which agents in the
 // field have picked up a release.
-const AgentVersion = "1.2.0"
+// 1.4.0 — upload-aggregator fix (sums fp.UpSpeed unconditionally so
+// usenet uploads register on the strip total + speed graph), per-file
+// Size + Transferred populated, ProgressCallback signature carries
+// total/transferred bytes, opt-in cache hit before DHT.
+const AgentVersion = "1.4.0"

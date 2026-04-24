@@ -24,204 +24,28 @@ const layoutHTML = `<!doctype html>
 <meta charset="utf-8">
 <title>{{block "title" .}}Agent{{end}} — indexer-agent</title>
 <link rel="icon" href="data:,"> {{/* suppress favicon 404 without shipping one */}}
-<style>
-:root {
-  --bg:         #0f1115;
-  --sidebar-bg: #151820;
-  --panel-bg:   #1a1e28;
-  --panel-edge: #252a36;
-  --text:       #e6e8ee;
-  --text-muted: #8b8f9a;
-  --accent:     #4a9eff;
-  --accent-dim: #2b5a8f;
-  --ok:         #10b981;
-  --warn:       #f59e0b;
-  --err:        #ef4444;
-  --row-hover:  #1d2230;
-}
-* { box-sizing: border-box; }
-body {
-  margin: 0;
-  font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
-  background: var(--bg);
-  color: var(--text);
-  display: flex;
-  min-height: 100vh;
-}
-
-/* ── Sidebar ──────────────────────────────────────────────── */
-.sidebar {
-  width: 260px;
-  min-width: 260px;
-  background: var(--sidebar-bg);
-  border-right: 1px solid var(--panel-edge);
-  display: flex;
-  flex-direction: column;
-  padding: 16px;
-  gap: 16px;
-  position: sticky;
-  top: 0;
-  height: 100vh;
-  overflow-y: auto;
-}
-.brand {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  font-weight: 600;
-  font-size: 15px;
-  letter-spacing: 0.02em;
-  color: var(--text);
-}
-.brand .version { color: var(--text-muted); font-weight: 400; font-size: 11px; }
-
-.card {
-  background: var(--panel-bg);
-  border: 1px solid var(--panel-edge);
-  border-radius: 6px;
-  padding: 10px 12px;
-  font-size: 12.5px;
-}
-.card-head {
-  color: var(--text-muted);
-  text-transform: uppercase;
-  letter-spacing: 0.08em;
-  font-size: 10.5px;
-  font-weight: 600;
-  margin-bottom: 8px;
-}
-.status-row { display: flex; justify-content: space-between; padding: 2px 0; }
-.status-row .k { color: var(--text-muted); }
-.status-row .v { color: var(--text); font-variant-numeric: tabular-nums; }
-
-.dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; vertical-align: middle; background: var(--text-muted); }
-.dot.ok  { background: var(--ok);  box-shadow: 0 0 6px rgba(16,185,129,0.5); }
-.dot.err { background: var(--err); box-shadow: 0 0 6px rgba(239,68,68,0.5); }
-.dot.warn{ background: var(--warn);box-shadow: 0 0 6px rgba(245,158,11,0.5); }
-
-.speed-row { display: flex; justify-content: space-between; align-items: baseline; }
-.speed-row .down { color: var(--ok); }
-.speed-row .up   { color: var(--accent); }
-.speed-row .num  { font-weight: 600; font-variant-numeric: tabular-nums; }
-.speed-row .unit { color: var(--text-muted); font-size: 11px; margin-left: 2px; }
-
-#speed-graph {
-  width: 100%; height: 40px;
-  margin-top: 6px;
-  stroke: var(--accent); fill: none; stroke-width: 1;
-}
-
-.nav-group { display: flex; flex-direction: column; }
-.nav-group .head {
-  color: var(--text-muted); text-transform: uppercase;
-  letter-spacing: 0.08em; font-size: 10.5px; font-weight: 600;
-  padding: 4px 8px; margin-top: 4px;
-}
-.nav-group a {
-  display: flex; justify-content: space-between; align-items: center;
-  padding: 7px 10px; color: var(--text-muted); text-decoration: none;
-  border-radius: 4px; font-size: 13px;
-}
-.nav-group a:hover { color: var(--text); background: var(--row-hover); }
-.nav-group a.active { color: var(--text); background: var(--accent-dim); }
-.nav-group a .count {
-  color: var(--text);
-  background: var(--accent-dim);
-  font-size: 10.5px;
-  padding: 1px 6px;
-  border-radius: 8px;
-  min-width: 16px;
-  text-align: center;
-}
-.nav-group a .count:empty { display: none; }
-
-.sidebar .footer {
-  margin-top: auto;
-  color: var(--text-muted);
-  font-size: 11px;
-  padding-top: 8px;
-  border-top: 1px solid var(--panel-edge);
-}
-
-/* ── Main column ──────────────────────────────────────────── */
-.main {
-  flex: 1;
-  display: flex;
-  flex-direction: column;
-  min-width: 0;
-}
-.topbar {
-  height: 48px;
-  border-bottom: 1px solid var(--panel-edge);
-  display: flex;
-  align-items: center;
-  padding: 0 20px;
-  background: var(--sidebar-bg);
-  gap: 16px;
-  position: sticky; top: 0; z-index: 10;
-}
-.topbar h1 { margin: 0; font-size: 15px; font-weight: 600; }
-.topbar .spacer { flex: 1; }
-.topbar .btn { padding: 5px 12px; }
-
-.content { padding: 20px; flex: 1; }
-.content p.lead { color: var(--text-muted); margin-top: 0; }
-
-/* ── Controls ─────────────────────────────────────────────── */
-input, textarea, select, button {
-  background: var(--panel-bg);
-  color: var(--text);
-  border: 1px solid var(--panel-edge);
-  border-radius: 4px;
-  padding: 5px 9px;
-  font: inherit;
-}
-input:focus, textarea:focus, select:focus { outline: none; border-color: var(--accent); }
-textarea { min-height: 4em; width: 100%; resize: vertical; }
-button { cursor: pointer; }
-button:hover { border-color: var(--accent); }
-button.primary  { background: var(--accent-dim); border-color: var(--accent); }
-button.primary:hover { background: var(--accent); color: #fff; }
-button.danger   { background: #3a1f1f; border-color: #6a2c2c; }
-button.danger:hover { background: #5a2828; }
-
-table { width: 100%; border-collapse: collapse; font-size: 13px; }
-th, td { padding: 8px 10px; border-bottom: 1px solid var(--panel-edge); text-align: left; vertical-align: top; }
-th { color: var(--text-muted); font-weight: 500; text-transform: uppercase; font-size: 10.5px; letter-spacing: 0.06em; }
-tr:hover td { background: var(--row-hover); }
-
-code { background: var(--panel-bg); padding: 1px 5px; border-radius: 3px; font-size: 12px; }
-
-.badge { display: inline-block; padding: 2px 7px; font-size: 10.5px; border-radius: 10px; background: var(--panel-edge); color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.04em; }
-.badge.ok      { background: rgba(16,185,129,0.15);  color: var(--ok);  }
-.badge.err     { background: rgba(239,68,68,0.15);   color: var(--err); }
-.badge.warn    { background: rgba(245,158,11,0.15);  color: var(--warn);}
-.badge.yml     { background: rgba(74,158,255,0.15);  color: var(--accent);}
-.badge.env     { background: rgba(245,158,11,0.12);  color: #d2a35a;    }
-.badge.local   { background: rgba(16,185,129,0.1);   color: #4db391;    }
-.badge.site    { background: rgba(74,158,255,0.12);  color: #6aaeff;    }
-.badge.default { background: var(--panel-edge);      color: var(--text-muted); }
-
-.flash { padding: 8px 12px; border-radius: 4px; margin-bottom: 16px; font-size: 13px; }
-.flash.ok  { background: rgba(16,185,129,0.1); border: 1px solid rgba(16,185,129,0.4); color: #4db391; }
-.flash.err { background: rgba(239,68,68,0.1);  border: 1px solid rgba(239,68,68,0.4);  color: #ee8080; }
-
-.small { color: var(--text-muted); font-size: 11.5px; }
-
-.row-form { display: contents; } /* forms in table rows don't disrupt layout */
-</style>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+{{/* Load order: tokens (palette) → shared components (.dot/.alert)
+     → agent-shell primitives (.local-shell-scoped cards/rows/bars)
+     → agent-specific layout. All four baked into the binary via
+     //go:embed — see services/localui_assets.go. */}}
+<link rel="stylesheet" href="/_shared/tokens.css">
+<link rel="stylesheet" href="/_shared/components.css">
+<link rel="stylesheet" href="/_shared/agent-shell.css">
+<link rel="stylesheet" href="/static/localui.css">
 </head>
 <body>
-<aside class="sidebar">
+<aside class="sidebar local-shell">
   <div class="brand">
-    <span>indexer-agent</span>
-    <span class="version">local UI</span>
+    {{if .SiteURL}}<a href="{{.SiteURL}}" class="wordmark" target="_blank" rel="noopener">ameNZB</a>{{else}}<span class="wordmark">ameNZB</span>{{end}}
+    <span class="subtitle">agent · local UI</span>
   </div>
 
   <div class="card">
     <div class="card-head">Agent</div>
-    <div class="status-row"><span class="k"><span class="dot ok" id="live-agent-dot"></span>State</span><span class="v" id="live-phase">idle</span></div>
-    <div class="status-row"><span class="k">VPN</span><span class="v"><span class="dot {{if eq .VPNStatus "Connected"}}ok{{else if eq .VPNStatus "Disconnected"}}err{{else}}warn{{end}}" id="live-vpn-dot"></span><span id="live-vpn">{{.VPNStatus}}</span></span></div>
+    <div class="status-row"><span class="k"><span class="dot dot-success" id="live-agent-dot"></span>State</span><span class="v" id="live-phase">idle</span></div>
+    <div class="status-row"><span class="k">VPN</span><span class="v"><span class="dot {{if eq .VPNStatus "Connected"}}dot-success{{else if eq .VPNStatus "Disconnected"}}dot-danger{{else}}dot-warning{{end}}" id="live-vpn-dot"></span><span id="live-vpn">{{.VPNStatus}}</span></span></div>
     <div class="status-row"><span class="k">Public IP</span><span class="v" id="live-ip">{{.PublicIP}}</span></div>
   </div>
 
@@ -231,13 +55,21 @@ code { background: var(--panel-bg); padding: 1px 5px; border-radius: 3px; font-s
       <span>↓ <span class="down num" id="live-down">0</span><span class="unit" id="live-down-unit">B/s</span></span>
       <span>↑ <span class="up num" id="live-up">0</span><span class="unit" id="live-up-unit">B/s</span></span>
     </div>
-    <svg id="speed-graph" viewBox="0 0 100 30" preserveAspectRatio="none"></svg>
+    <svg id="speed-graph" class="speed-graph" viewBox="0 0 100 30" preserveAspectRatio="none"></svg>
   </div>
 
   <div class="card">
     <div class="card-head">Disk</div>
     <div class="status-row"><span class="k">Free</span><span class="v" id="live-disk-free">—</span></div>
     <div class="status-row"><span class="k">Reserved</span><span class="v" id="live-disk-reserved">—</span></div>
+    {{/* Usage bar — rendered only when the SSE feed includes disk_total_gb
+         > 0 (Linux hosts; stub platforms send 0 and we hide the bar to
+         avoid lying with fake values). Fill color shifts red past 85%
+         so operators notice before ENOSPC kills a job. */}}
+    <div id="live-disk-usage-wrap" style="display:none;margin-top:6px;">
+      <div class="disk-bar-track"><div class="disk-bar-fill" id="live-disk-bar" style="width:0%;"></div></div>
+      <div class="status-row" style="margin-top:2px;"><span class="k" id="live-disk-pct">—</span><span class="v small" id="live-disk-total"></span></div>
+    </div>
   </div>
 
   <div class="nav-group">
@@ -246,9 +78,22 @@ code { background: var(--panel-bg); padding: 1px 5px; border-radius: 3px; font-s
     <a href="/watches"{{if eq .CurrentPage "watches"}} class="active"{{end}}>Watch Folders</a>
     <a href="/groups"{{if eq .CurrentPage "groups"}} class="active"{{end}}>Groups</a>
     <a href="/"{{if eq .CurrentPage "config"}} class="active"{{end}}>Config</a>
+    {{if .SiteURL}}<a href="{{.SiteURL}}" target="_blank" rel="noopener" class="external">Site dashboard <span class="external-arrow">↗</span></a>{{end}}
   </div>
 
-  <div class="footer">Loopback only — bind: <code>{{.BindAddr}}</code></div>
+  {{/* Footer is honest about the bind: when bound to loopback the
+       "local-only" badge is green-ish; when bound to anything else
+       (e.g. 0.0.0.0 behind a reverse proxy, or a LAN IP) the badge
+       turns red so the operator can't miss that this UI — which has
+       no auth — is reachable off-host. */}}
+  <div class="footer">
+    {{if or (eq .BindAddr "127.0.0.1") (eq .BindAddr "localhost") (eq .BindAddr "::1")}}
+    <span class="badge ok">loopback-only</span> bind: <code>{{.BindAddr}}</code>
+    {{else}}
+    <span class="badge err">exposed</span> bind: <code>{{.BindAddr}}</code>
+    <div style="margin-top:4px;color:var(--red);">This UI has no auth — put a reverse proxy with auth in front of it or rebind to 127.0.0.1.</div>
+    {{end}}
+  </div>
 </aside>
 
 <div class="main">
@@ -258,8 +103,8 @@ code { background: var(--panel-bg); padding: 1px 5px; border-radius: 3px; font-s
     {{block "topbar-actions" .}}{{end}}
   </header>
   <main class="content">
-    {{if .Flash}}<div class="flash ok">{{.Flash}}</div>{{end}}
-    {{if .Err}}<div class="flash err">{{.Err}}</div>{{end}}
+    {{if .Flash}}<div class="alert alert-success">{{.Flash}}</div>{{end}}
+    {{if .Err}}<div class="alert alert-danger">{{.Err}}</div>{{end}}
     {{block "content" .}}<p>no content</p>{{end}}
   </main>
 </div>
@@ -291,10 +136,11 @@ code { background: var(--panel-bg); padding: 1px 5px; border-radius: 3px; font-s
     const el = document.getElementById(id);
     if (el && el.textContent !== String(txt)) el.textContent = txt;
   }
-  function setDot(id, cls) {
+  function setDot(id, variant) {
+    // variant is "success" | "danger" | "warning" (matches .dot-* suffix in components.css).
     const el = document.getElementById(id);
     if (!el) return;
-    el.className = 'dot ' + cls;
+    el.className = 'dot dot-' + variant;
   }
 
   // redrawGraph draws download + upload as two polylines, scaled to the
@@ -339,16 +185,33 @@ code { background: var(--panel-bg); padding: 1px 5px; border-radius: 3px; font-s
 
     // Agent "State" dot green when doing useful work, amber when idle —
     // lets the operator see at a glance whether the pipeline is flowing.
-    setDot('live-agent-dot', d.phase && d.phase !== 'idle' ? 'ok' : 'warn');
+    setDot('live-agent-dot', d.phase && d.phase !== 'idle' ? 'success' : 'warning');
     setDot('live-vpn-dot',
-      d.vpn_status === 'Connected' ? 'ok' :
-      d.vpn_status === 'Disconnected' ? 'err' : 'warn');
+      d.vpn_status === 'Connected' ? 'success' :
+      d.vpn_status === 'Disconnected' ? 'danger' : 'warning');
 
     if (typeof d.disk_free_gb === 'number') {
       setText('live-disk-free', d.disk_free_gb.toFixed(1) + ' GB');
     }
     if (typeof d.disk_reserved_gb === 'number') {
       setText('live-disk-reserved', d.disk_reserved_gb.toFixed(1) + ' GB');
+    }
+    // Usage bar: compute used% from (total - free - reserved) / total.
+    // Stub platforms send disk_total_gb = 0; leave the bar hidden then.
+    const wrap = document.getElementById('live-disk-usage-wrap');
+    if (wrap && d.disk_total_gb > 0) {
+      const reserved = d.disk_reserved_gb || 0;
+      const used = d.disk_total_gb - d.disk_free_gb - reserved;
+      const pct = Math.max(0, Math.min(100, (used / d.disk_total_gb) * 100));
+      const fill = document.getElementById('live-disk-bar');
+      if (fill) {
+        fill.style.width = pct.toFixed(1) + '%';
+        fill.className = 'disk-bar-fill' +
+          (pct >= 95 ? ' danger' : pct >= 85 ? ' warn' : '');
+      }
+      setText('live-disk-pct', pct.toFixed(0) + '% used');
+      setText('live-disk-total', 'of ' + d.disk_total_gb.toFixed(0) + ' GB');
+      wrap.style.display = '';
     }
 
     if (d.jobs) {
@@ -372,7 +235,7 @@ code { background: var(--panel-bg); padding: 1px 5px; border-radius: 3px; font-s
     });
     // EventSource auto-reconnects on network errors; we only flag it
     // visually so the operator knows the sidebar isn't lying.
-    es.addEventListener('error', () => setDot('live-agent-dot', 'warn'));
+    es.addEventListener('error', () => setDot('live-agent-dot', 'warning'));
   } catch (e) { /* old browser / CSP; sidebar stays static */ }
 })();
 </script>
@@ -411,5 +274,6 @@ func (u *LocalUI) baseData(currentPage string, flash, errMsg string) map[string]
 		"BindAddr":    u.bindAddr,
 		"VPNStatus":   vpn,
 		"PublicIP":    ip,
+		"SiteURL":     u.cfg.SiteURL,
 	}
 }
